@@ -1,9 +1,9 @@
 from datetime import datetime
 from threading import Event
 
-import pytz
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+import pytz # type: ignore
+from apscheduler.schedulers.background import BackgroundScheduler # type: ignore
+from apscheduler.triggers.cron import CronTrigger # type: ignore
 
 from app.downloader import Downloader
 from app.message import Message
@@ -24,9 +24,9 @@ class TorrentMark(_IPluginModule):
     # 插件版本
     module_version = "1.0"
     # 插件作者
-    module_author = "hsuyelin"
+    module_author = "jonee"
     # 作者主页
-    author_url = "https://github.com/hsuyelin"
+    author_url = "https://github.com/joneezhu"
     # 插件配置项ID前缀
     module_config_prefix = "torrentmark_"
     # 加载顺序

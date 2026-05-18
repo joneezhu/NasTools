@@ -468,14 +468,13 @@ class Qbittorrent(_IDownloadClient):
         try:
             # 读取设置的管理模式
             if is_auto is None:
-                match self._torrent_management:
-                    case "default":
-                        if self.__get_qb_auto():
-                            is_auto = True
-                    case "auto":
+                if self._torrent_management == "default":
+                    if self.__get_qb_auto():
                         is_auto = True
-                    case "manual":
-                        is_auto = False
+                elif self._torrent_management == "auto":
+                    is_auto = True
+                elif self._torrent_management == "manual":
+                    is_auto = False
 
             # 自动管理模式没有分类时，根据保存目录获取
             if is_auto and not category:

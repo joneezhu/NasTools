@@ -29,9 +29,9 @@ class Prowlarr(_IPluginModule):
     # 插件版本
     module_version = "1.5"
     # 插件作者
-    module_author = "hsuyelin"
+    module_author = "jonee"
     # 作者主页
-    author_url = "https://github.com/hsuyelin"
+    author_url = "https://github.com/joneezhu"
     # 插件配置项ID前缀
     module_config_prefix = "prowlarr"
     # 加载顺序
