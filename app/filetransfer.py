@@ -1246,7 +1246,7 @@ class FileTransfer:
         en_title = self.media.get_tmdb_en_title(media)
         try:
             decade = (int(media.year) // 10) * 10
-        except:
+        except Exception:
             decade = 0
         media_format_dict = {
             "title": StringUtils.clear_file_name(media.title),

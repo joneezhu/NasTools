@@ -1822,7 +1822,7 @@ def Img():
       response.headers.set('Cache-Control', 'max-age=604800')
       response.headers.set('Etag', etag)
       return response
-    except:
+    except Exception:
       return make_response("图片加载失败", 400)
 
 @App.route('/stream-logging')

@@ -160,7 +160,8 @@ class Torrent:
         file_names = []
         file_folder = ""
         try:
-            torrent = bdecode(open(path, 'rb').read())
+            with open(path, 'rb') as f:
+                torrent = bdecode(f.read())
             if torrent.get("info"):
                 files = torrent.get("info", {}).get("files") or []
                 if files:
@@ -417,7 +418,7 @@ class Torrent:
         try:
             with open(file_path, 'r+') as file:
                 file.close()
-        except:
+        except Exception:
             pass
 
         try:
