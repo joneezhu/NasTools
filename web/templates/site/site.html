@@ -221,6 +221,16 @@
           </div>
         </div>
         <div class="row">
+          <div class="col-lg-12">
+            <div class="mb-3">
+              <label class="form-label">签到自定义参数 <span class="form-help"
+                  title="部分站点（如 pttime）签到时需要附加 URL 参数，可在此填写。格式：uid=12345 或 uid=12345&token=abc，无需带前导 ?。仅对支持该机制的签到处理类生效。"
+                  data-bs-toggle="tooltip">?</span></label>
+              <input type="text" class="form-control" id="site_signurl_params" value="" placeholder="如：uid=12345 或 uid=12345&token=abc">
+            </div>
+          </div>
+        </div>
+        <div class="row">
           <div class="col-lg-4">
             <div class="mb-3">
               <label class="form-label required">RSS解析种子详情 <span class="form-help"
@@ -490,6 +500,7 @@
     $("#site_rule").val('');
     $("#site_ua").val('');
     $("#site_apikey").val('');
+    $("#site_signurl_params").val('');
     $("#site_chrome").val('N');
     $("#site_proxy").val('N');
     $("#site_parse").val('Y');
@@ -519,6 +530,7 @@
         $("#site_cookie").val(ret.site.cookie);
         $("#site_ua").val(ret.site.ua);
         $("#site_apikey").val(ret.site.apikey);
+        $("#site_signurl_params").val(ret.site.signurl_params || '');
         $("#site_download_setting").val(ret.site.download_setting);
         if (ret.site.parse) {
           $("#site_parse").val("Y");
@@ -618,6 +630,7 @@
     };
     let ua = $("#site_ua").val();
     let apikey = $("#site_apikey").val();
+    let signurl_params = $("#site_signurl_params").val();
     let chrome = $("#site_chrome").val();
     let proxy = $("#site_proxy").val();
     let subtitle = $("#site_subtitle").val();
@@ -658,6 +671,7 @@
         "parse": site_parse,
         "ua": ua,
         "apikey": apikey,
+        "signurl_params": signurl_params,
         "chrome": chrome,
         "proxy": proxy,
         "message": site_unread_msg_notify,

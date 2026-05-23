@@ -98,6 +98,7 @@ class Sites:
                 "limit_interval": site_note.get("limit_interval"),
                 "limit_count": site_note.get("limit_count"),
                 "limit_seconds": site_note.get("limit_seconds"),
+                "signurl_params": site_note.get("signurl_params"),
                 "strict_url": StringUtils.get_base_url(site_signurl or site_rssurl)
             }
             # 以ID存储
