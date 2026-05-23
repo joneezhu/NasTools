@@ -269,7 +269,7 @@ class SiteUserInfo(object):
         # 刷完发送消息
         string_list = []
 
-        # 增量数据
+        # 增量数据（基于站点统计历史快照差值）
         incUploads = 0
         incDownloads = 0
         _, _, site, upload, download = SiteUserInfo().get_pt_site_statistics_history(2)
@@ -290,13 +290,49 @@ class SiteUserInfo(object):
                                    f"下载量：{StringUtils.str_filesize(download)}\n"
                                    f"\n————————————")
 
+        # 增量为 0（首次跑 / 昨日无快照 / 真的没变化）时回退到当前总量快照，避免静默无消息
         if incDownloads or incUploads:
             string_list.insert(0, f"【今日汇总】\n"
                                   f"总上传：{StringUtils.str_filesize(incUploads)}\n"
                                   f"总下载：{StringUtils.str_filesize(incDownloads)}\n"
                                   f"\n————————————")
+        else:
+            # 回退：用 _sites_data 里刚抓到的当前总量出一份概览
+            totalUpload = 0
+            totalDownload = 0
+            fallback_lines = []
+            for sname, info in (self._sites_data or {}).items():
+                if not isinstance(info, dict):
+                    continue
+                up = info.get("upload") or 0
+                dn = info.get("download") or 0
+                ratio = info.get("ratio")
+                bonus = info.get("bonus")
+                seeding = info.get("seeding") or 0
+                if isinstance(up, (int, float)) and isinstance(dn, (int, float)):
+                    totalUpload += int(up)
+                    totalDownload += int(dn)
+                fallback_lines.append(
+                    f"【{sname}】\n"
+                    f"上传量：{StringUtils.str_filesize(up)}\n"
+                    f"下载量：{StringUtils.str_filesize(dn)}\n"
+                    f"分享率：{ratio}\n"
+                    f"做种数：{seeding}\n"
+                    f"魔力值：{bonus}\n"
+                    f"\n————————————"
+                )
+            if fallback_lines:
+                string_list = fallback_lines
+                string_list.insert(0,
+                    f"【当前总量（无今日增量数据）】\n"
+                    f"总上传：{StringUtils.str_filesize(totalUpload)}\n"
+                    f"总下载：{StringUtils.str_filesize(totalDownload)}\n"
+                    f"\n————————————")
+            else:
+                # 极端情况：站点全失败抓不到数据
+                string_list = ["站点数据统计完成，但本次未抓取到任何站点数据，请检查站点配置或网络。"]
 
-            self.message.send_user_statistics_message(string_list)
+        self.message.send_user_statistics_message(string_list)
 
     def get_site_data(self, specify_sites=None, force=False):
         """
