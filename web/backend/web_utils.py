@@ -68,13 +68,19 @@ class WebUtils:
             include_prerelease = app_cfg.get("include_prerelease", True)
 
             req = RequestUtils(proxies=Config().get_proxies())
-            list_res = req.get_res(
-                "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=10"
-            )
-            if not list_res or list_res.status_code != 200:
+            list_url = "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=10"
+            list_res = req.get_res(list_url)
+            if not list_res:
+                # 通常是连不上 GitHub（DNS / 代理 / 网络），请求层直接返回 None
                 log.warn(
-                    f"【Version】拉取 GitHub releases 列表失败 status="
-                    f"{getattr(list_res, 'status_code', 'N/A')}"
+                    f"【Version】拉取 GitHub releases 列表无响应：{list_url}"
+                    f"（请检查网络或代理设置；不影响主程序运行）"
+                )
+                return None, None
+            if list_res.status_code != 200:
+                log.warn(
+                    f"【Version】拉取 GitHub releases 列表失败 status={list_res.status_code}"
+                    f" url={list_url}"
                 )
                 return None, None
             releases = list_res.json() or []

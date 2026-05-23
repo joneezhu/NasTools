@@ -1284,10 +1284,37 @@ class WebAction:
                 if running != "0":
                     log.warn("【Update】已有更新进程在跑，本次不重复触发")
                     return {"code": 1, "msg": "已有更新进程在执行，请稍后再试"}
-                rc, _, _ = _run("nastool update", timeout=1800)
-                if rc != 0:
-                    log.error(f"【Update】群晖 nastool update 失败 rc={rc}，不重启")
-                    return {"code": 1, "msg": f"群晖更新命令失败 (rc={rc})，详情查看日志"}
+                rc, out, err = _run("nastool update", timeout=1800)
+                # 注意：群晖 `nastool update` 即使 git reset 出现 Permission denied，
+                # 也常常以 rc=0 退出 + stdout 打印 "更新失败，继续使用旧的程序来启动..."。
+                # 仅靠 rc 判断会误判成功并继续 restart_server，
+                # 重启后用旧/混合代码启动，再触发 BuiltinIndexerFileMd5 校验失败。
+                # 这里增加 stdout/stderr 关键字检测，强制识别为失败。
+                err_keywords = [
+                    "更新失败",
+                    "unable to unlink",
+                    "Permission denied",
+                    "error: unable to",
+                    "fatal:",
+                ]
+                combined = f"{out}\n{err}"
+                hit_keywords = [kw for kw in err_keywords if kw in combined]
+                if rc != 0 or hit_keywords:
+                    if hit_keywords:
+                        log.error(
+                            f"【Update】群晖 nastool update 检测到失败关键字 {hit_keywords}（rc={rc}），"
+                            f"判定为失败，不重启服务"
+                        )
+                        msg = (
+                            "群晖更新失败：检测到权限不足或 git 错误"
+                            f"（命中关键字：{', '.join(hit_keywords[:3])}）。"
+                            "请到 套件中心 → NASTool → 操作 → 修复，或登录 SSH 用 root 执行："
+                            "chown -R nt:nt /var/packages/NASTool/target  后再试。"
+                        )
+                    else:
+                        log.error(f"【Update】群晖 nastool update 失败 rc={rc}，不重启")
+                        msg = f"群晖更新命令失败 (rc={rc})，详情查看日志"
+                    return {"code": 1, "msg": msg}
                 log.info("【Update】群晖更新成功，准备重启服务")
 
             elif env == "docker":
