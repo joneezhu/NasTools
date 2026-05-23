@@ -1,7 +1,7 @@
 # NAStool 更新文档（CHANGELOG）
 
 > 文档编写：2026-05-18
-> 当前最新版本：**v3.4.2**
+> 当前最新版本：**v3.4.3**
 > 版本号规范：见 `RELEASE.md` 第一节
 
 本文档遵循 [Keep a Changelog 1.1.0](https://keepachangelog.com/zh-CN/1.1.0/) 风格。每次发布必须在顶部新增一节，按 **Added / Changed / Fixed / Removed / Security / Deprecated** 分类列出变更。
@@ -35,6 +35,14 @@
 ### Fixed
 - _（待补充）_
 
+---
+
+## [v3.4.3] - 2026-05-23
+
+> 自动生成自 v3.4.2 至本次发布的 commit。
+
+### Changed
+- 修改版本发布脚本 (628eb88)
 ---
 
 ## [v3.4.2] - 2026-05-23
