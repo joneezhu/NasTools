@@ -265,11 +265,10 @@ if $SKIP_COMMIT_TAG; then
   if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
     : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
     : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
-    log "通过 gh 触发 build.yml (Docker stable 通道, ref=$NEW_VERSION)..."
+    log "通过 gh 触发 build.yml (Docker Alpine + Debian, ref=$NEW_VERSION)..."
     gh workflow run build.yml --ref "$NEW_VERSION" \
       -f docker_username="$DOCKER_USERNAME" \
-      -f docker_password="$DOCKER_PASSWORD" \
-      -f channel=stable
+      -f docker_password="$DOCKER_PASSWORD"
     ok "build.yml 已派发 (ref=$NEW_VERSION)"
   fi
 
@@ -604,9 +603,8 @@ if ! $RUN_BUILD; then
   echo "    需要触发构建请运行 (会基于 tag $NEW_VERSION 派发 workflow):"
   echo "      scripts/release.sh $NEW_VERSION --build"
   echo "    或者直接手动:"
-  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=... -f channel=stable"
+  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=..."
   echo "      gh workflow run build-package.yml --ref $NEW_VERSION"
-  echo "    (beta 通道: -f channel=beta; 同时跑稳定+beta: -f channel=both)"
   echo
   ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
   exit 0
@@ -618,7 +616,7 @@ fi
 
 if ! command -v gh >/dev/null 2>&1; then
   warn "未安装 gh CLI, 请到 GitHub Actions 页面手动触发以下两条流水线 (ref 选 tag $NEW_VERSION):"
-  echo "    - .github/workflows/build.yml         (channel=stable / beta / both)"
+  echo "    - .github/workflows/build.yml"
   echo "    - .github/workflows/build-package.yml"
   exit 0
 fi
@@ -630,13 +628,10 @@ fi
 # ref 一律用新 tag, 而非 master 分支:
 # 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
 # 2) 用分支名时, 如果之后该分支又有新 commit, ref 会漂移; 用 tag 永远精确指向本次发布
-log "通过 gh 触发 build.yml (Docker Hub 主线 stable 通道, ref=$NEW_VERSION)..."
-# 默认只跑 stable 通道 (Alpine + Debian); 如需 beta 单独手动派发:
-#   gh workflow run build.yml --ref <tag> -f channel=beta -f docker_username=... -f docker_password=...
+log "通过 gh 触发 build.yml (Docker Hub Alpine + Debian, ref=$NEW_VERSION)..."
 gh workflow run build.yml --ref "$NEW_VERSION" \
   -f docker_username="$DOCKER_USERNAME" \
-  -f docker_password="$DOCKER_PASSWORD" \
-  -f channel=stable
+  -f docker_password="$DOCKER_PASSWORD"
 
 log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
 # build-package.yml 不再声明任何 inputs (改用 secrets.GITHUB_TOKEN), 不要传 -f github_token=...

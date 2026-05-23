@@ -39,10 +39,10 @@ v<MAJOR>.<MINOR>.<PATCH>
 
 | Tag | 含义 |
 |------|------|
-| `latest` | 最新稳定版（master 分支构建） |
-| `vX.Y.Z` | 特定版本 |
-| `beta` | 公测版（`debian-beta.Dockerfile` 构建） |
-| `dev` | 开发版（`dev` 分支） |
+| `latest` | 最新稳定版（Alpine 镜像，master 分支构建） |
+| `vX.Y.Z` | 特定版本（Alpine 镜像） |
+| `debian` | 最新稳定版（Debian 镜像） |
+| `vX.Y.Z-debian` | 特定版本（Debian 镜像） |
 
 ### 2.2 PyInstaller 可执行文件命名
 
@@ -285,7 +285,7 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 5. 创建 `release: bump version to vX.Y.Z` commit，附带 5 条核心修改点
 6. 打 annotated tag，tag message 内嵌结构化变更摘要（标题区 + 类目分组 + emoji 图标，默认上限 12 条，可用 `--tag-limit=N` 调整）
 7. push master + tag 到远端
-8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub，默认 channel=stable）与 `build-package.yml`（二进制 + Release）
+8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub，Alpine + Debian）与 `build-package.yml`（二进制 + Release）
 
 #### 幂等行为（可重入）
 
