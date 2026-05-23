@@ -3,12 +3,11 @@
 # NAStool GitHub Release 自动化脚本
 #
 # 功能:
-#   读取 docs/changelog/<tag>.md 作为 body, 调用 gh release create / edit
-#   创建或更新 GitHub Release。
+#   生成"自上一个已发布 Release 至当前 tag"的扁平 changelog 作为 body,
+#   调用 gh release create / edit 创建或更新 GitHub Release。
 #
 #   - 已存在 Release  -> 仅 edit 更新 title/body, 不动 assets (幂等)
 #   - 不存在 Release  -> create, 可选附加本地 assets
-#   - 单 tag changelog 不存在 -> 报错退出, 提示先跑 release.sh
 #
 # 用法:
 #   scripts/release-github.sh <tag>                       # 例: v3.4.3
@@ -17,22 +16,24 @@
 #   scripts/release-github.sh <tag> --latest              # 标记为 latest (默认会自动判断)
 #   scripts/release-github.sh <tag> --assets=path1,path2  # 上传本地附件
 #   scripts/release-github.sh <tag> --force-recreate      # 删除现有 Release 后重建 (会丢失 assets)
-#   scripts/release-github.sh <tag> --single              # 仅用当前 tag 的 changelog (不聚合中间漏发的 tag)
-#   scripts/release-github.sh <tag> --since=vX.Y.Z        # 强制指定起点 tag, 聚合 (since, tag] 区间
+#   scripts/release-github.sh <tag> --single              # 仅用当前 tag 单文件 docs/changelog/<tag>.md
+#   scripts/release-github.sh <tag> --since=vX.Y.Z        # 强制指定起点 tag, 区间 (since, tag]
 #   scripts/release-github.sh <tag> --dry-run             # 只打印不执行
 #
-# Release body 聚合策略 (默认):
+# Release body 生成策略 (默认):
 #   * 自动找出"上一个已发布的 GitHub Release"作为起点 (LAST_RELEASED)
-#   * 收集 git tag 中 LAST_RELEASED < t <= <tag> 的所有 tag, 把对应的
-#     docs/changelog/<t>.md 按版本号倒序合并 (新版本在前)
-#   * 这样即使中间有 tag 没单独建 Release, 它们的 changelog 也会一起呈现
-#   * 想退回到原行为 (仅当前 tag) 加 --single, 想强制起点加 --since=vX.Y.Z
+#   * 直接读 git log (LAST_RELEASED, <tag>] 区间所有 commit, 调用共享脚本
+#     scripts/_changelog_gen.py 重新分类/去重/格式化, 输出一份完整 changelog
+#   * 这与 release.sh 生成单 tag changelog 用的是同一份格式逻辑, 区别仅在区间不同
+#   * 中间漏发的 tag 不会被分段折叠展示, 而是"当成本次发布的一部分"扁平铺开
+#   * 想退回到原行为 (只用 docs/changelog/<tag>.md 文件) 加 --single
+#   * 想强制起点加 --since=vX.Y.Z
 #
 # 凭据:
 #   .release 文件中的 RELEASE_GH_TOKEN 会被加载到 GH_TOKEN 供 gh CLI 使用。
 #   如果已经 gh auth login, 直接复用本机凭据即可。
 #
-# 依赖: git, gh (GitHub CLI)
+# 依赖: git, gh (GitHub CLI), python3
 # =============================================================================
 set -euo pipefail
 
@@ -121,31 +122,29 @@ if [[ -z "${GH_TOKEN:-}" ]]; then
     || die "gh 未登录且未提供 GH_TOKEN, 请先 gh auth login 或在 .release 配置 RELEASE_GH_TOKEN"
 fi
 
-[[ -f "$CHANGELOG_FILE" ]] \
-  || die "未找到 $CHANGELOG_FILE, 请先执行 scripts/release.sh $TAG 生成单 tag changelog"
+if $SINGLE; then
+  [[ -f "$CHANGELOG_FILE" ]] \
+    || die "未找到 $CHANGELOG_FILE, 请先执行 scripts/release.sh $TAG 生成单 tag changelog"
+fi
 
 # 远端 tag 必须存在
 if ! git ls-remote --tags --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
   die "远端 origin 上不存在 tag $TAG, 请先 git push origin $TAG"
 fi
 
-# ---------- 聚合 changelog (默认行为) ----------
-# 找出 (起点 tag, $TAG] 区间内所有有 changelog 文件的 tag, 合并为一份 notes
+# ---------- 计算起点 tag (上一个已发布 Release) ----------
 # 起点 tag 选取顺序:
 #   1) 命令行 --since=vX.Y.Z 指定
-#   2) 自动: 取上一个已存在的 GitHub Release 的 tagName (语义版本 < $TAG 中最大的)
-#   3) 都没有 -> 起点为空, 收集所有 <= $TAG 的 tag
-
-# 计算起点 tag
+#   2) --single 模式: 不需要起点
+#   3) 自动: 取上一个已存在的 GitHub Release 的 tagName (语义版本 < $TAG 中最大的)
+#   4) 没有任何 Release -> 起点为空, 收集 $TAG 之前所有 commit
 START_TAG=""
 if [[ -n "$SINCE_TAG" ]]; then
   START_TAG="$SINCE_TAG"
   log "起点 tag (来自 --since): $START_TAG"
 elif $SINGLE; then
-  log "--single 模式: 仅使用 $TAG 自身的 changelog"
+  log "--single 模式: 直接使用 $TAG 单文件 changelog"
 else
-  # 通过 gh 列出所有 release, 找语义版本严格小于 $TAG 的最大那个
-  # gh release list 默认按时间倒序, 我们按 tagName 自行排序更稳健
   set +e
   RELEASES_JSON="$(gh release list --limit 100 --json tagName,isDraft 2>/dev/null)"
   rc=$?
@@ -156,7 +155,6 @@ import os, json, re
 target = os.environ.get("TARGET_TAG", "")
 raw    = os.environ.get("RELEASES_JSON", "[]")
 def vkey(t):
-    # vX.Y.Z[-suffix] -> (X, Y, Z, 0=有后缀/1=正式) 让 v3.4.2 > v3.4.2-rc.1
     m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$', t)
     if not m: return None
     x, y, z, suf = int(m[1]), int(m[2]), int(m[3]), m[4]
@@ -176,101 +174,70 @@ if candidates:
 PYEOF
 )"
     if [[ -n "$START_TAG" ]]; then
-      log "起点 tag (来自上一个 GitHub Release): $START_TAG"
+      log "起点 tag (上一个已发布 Release): $START_TAG"
     else
-      log "未找到比 $TAG 更早的已发布 Release, 将聚合所有 <= $TAG 的 changelog"
+      log "未找到比 $TAG 更早的已发布 Release, 将聚合 $TAG 之前所有 commit"
     fi
   else
-    log "尚无任何 GitHub Release, 将聚合所有 <= $TAG 的 changelog"
+    log "尚无任何 GitHub Release, 将聚合 $TAG 之前所有 commit"
   fi
 fi
 
-# 收集要聚合的 tag 列表 (区间: START_TAG 排除, TAG 包含)
-COLLECTED_TAGS=()
-if $SINGLE; then
-  COLLECTED_TAGS=("$TAG")
-else
-  # 列出所有 docs/changelog/v*.md 中存在的 tag, 用 python 过滤区间并按版本倒序
-  ALL_CHANGELOG_TAGS="$(ls "$REPO_ROOT/docs/changelog/" 2>/dev/null | sed -nE 's/^(v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)\.md$/\1/p')"
-  if [[ -z "$ALL_CHANGELOG_TAGS" ]]; then
-    die "docs/changelog/ 下没有可用的 v*.md 文件"
+# 如果指定了起点 tag, 校验它在 git 里能解析
+if [[ -n "$START_TAG" ]]; then
+  if ! git rev-parse --verify "$START_TAG" >/dev/null 2>&1; then
+    warn "本地不存在 tag $START_TAG, 尝试从 origin 拉取..."
+    git fetch --depth 1 origin "refs/tags/$START_TAG:refs/tags/$START_TAG" 2>/dev/null \
+      || die "无法解析起点 tag $START_TAG (本地与 origin 都没有), 请检查 --since 参数"
   fi
-  # 通过环境变量把列表传给 python (避免 heredoc + <<< 嵌套出问题)
-  COLLECTED_RAW="$(TARGET_TAG="$TAG" START_TAG="$START_TAG" ALL_TAGS="$ALL_CHANGELOG_TAGS" python3 <<'PYEOF'
-import os, re
-target = os.environ.get("TARGET_TAG", "")
-start  = os.environ.get("START_TAG", "")
-raw    = os.environ.get("ALL_TAGS", "")
-def vkey(t):
-    m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$', t)
-    if not m: return None
-    x, y, z, suf = int(m[1]), int(m[2]), int(m[3]), m[4]
-    return (x, y, z, 0 if suf else 1, suf or "")
-tk = vkey(target)
-sk = vkey(start) if start else None
-out = []
-for line in raw.splitlines():
-    line = line.strip()
-    if not line: continue
-    k = vkey(line)
-    if not k: continue
-    if tk and k > tk: continue
-    if sk and k <= sk: continue
-    out.append((k, line))
-out.sort(reverse=True)  # 新版本在前
-for _, t in out:
-    print(t)
-PYEOF
-)"
-  # shellcheck disable=SC2207
-  IFS=$'\n' COLLECTED_TAGS=( $COLLECTED_RAW )
-  unset IFS
 fi
 
-[[ ${#COLLECTED_TAGS[@]} -eq 0 ]] \
-  && die "聚合后的 tag 列表为空, 检查 docs/changelog/ 与 --since/--single 参数"
-
-log "聚合 changelog 顺序 (新→旧): ${COLLECTED_TAGS[*]}"
-
-# 生成聚合后的 notes 文件
+# ---------- 生成扁平 changelog (notes 文件) ----------
 NOTES_FILE="$(mktemp -t release-notes.XXXXXX.md)"
 trap 'rm -f "$NOTES_FILE"' EXIT
 
-if [[ ${#COLLECTED_TAGS[@]} -eq 1 ]]; then
-  # 只有一个 tag, 直接用它的文件 (保持简洁, 不加聚合头)
-  cat "$REPO_ROOT/docs/changelog/${COLLECTED_TAGS[0]}.md" > "$NOTES_FILE"
+if $SINGLE; then
+  # --single: 完全使用 docs/changelog/<tag>.md 内容
+  log "使用单 tag 模式: $CHANGELOG_FILE"
+  cat "$CHANGELOG_FILE" > "$NOTES_FILE"
 else
-  # 多 tag 聚合: 用 $TAG 自身文件作主体, 并把中间漏发的旧 tag 内容追加在 "Previous unreleased changes" 段
-  {
-    cat "$REPO_ROOT/docs/changelog/${TAG}.md"
-    echo
-    echo "---"
-    echo
-    echo "## 📚 Included previous changes"
-    echo
-    if [[ -n "$START_TAG" ]]; then
-      echo "> 本次发布同时包含 \`$START_TAG\` 之后所有未单独建 Release 的 tag 变更，按版本倒序合并："
-    else
-      echo "> 本次发布包含所有历史 tag 的变更（之前从未建过 Release），按版本倒序合并："
-    fi
-    echo
-    # 跳过第一个 (就是 $TAG 自身), 拼接其余
-    for t in "${COLLECTED_TAGS[@]:1}"; do
-      f="$REPO_ROOT/docs/changelog/${t}.md"
-      if [[ ! -f "$f" ]]; then
-        warn "缺失 $f, 跳过"
-        continue
-      fi
-      echo
-      echo "<details>"
-      echo "<summary><strong>$t</strong> (展开查看)</summary>"
-      echo
-      # 文件原内容里 H1 是 "# Release vX", 在 details 里降级到 H3 防破坏当前 H2 层级
-      sed -E 's/^# Release /### Release /' "$f"
-      echo
-      echo "</details>"
-    done
-  } > "$NOTES_FILE"
+  # 默认: 调用共享 changelog 生成器, 区间 (START_TAG, TAG]
+  SHARED_GEN="$REPO_ROOT/scripts/_changelog_gen.py"
+  [[ -f "$SHARED_GEN" ]] || die "缺少共享脚本: $SHARED_GEN"
+
+  # 解析 OWNER_REPO (用于 commit/issue 链接)
+  OWNER_REPO_FOR_GEN="$(git config --get remote.origin.url 2>/dev/null \
+    | sed -E 's#.*github.com[:/](.*)\.git#\1#' || true)"
+
+  if [[ -n "$START_TAG" ]]; then
+    GIT_RANGE="${START_TAG}..${TAG}"
+    RANGE_LABEL_FOR_GEN="$START_TAG"
+    log "git log 区间: $GIT_RANGE"
+  else
+    GIT_RANGE="$TAG"
+    RANGE_LABEL_FOR_GEN="initial"
+    log "无起点 tag, 使用 $TAG 之前所有 commit"
+  fi
+
+  RAW_LOG="$(git log "$GIT_RANGE" --no-merges --pretty=format:'%H%x09%s%x09%an' || true)"
+  COMMIT_COUNT="$(echo "$RAW_LOG" | grep -c $'\t' || true)"
+  log "区间内 commit 数: $COMMIT_COUNT"
+
+  # 调用共享生成器
+  PARSED="$(NEW_VERSION="$TAG" RANGE_LABEL="$RANGE_LABEL_FOR_GEN" \
+    USE_EMOJI=1 TAG_LIMIT=999 \
+    OWNER_REPO="$OWNER_REPO_FOR_GEN" \
+    python3 "$SHARED_GEN" <<<"$RAW_LOG")"
+
+  # 抽取 MARK_CHANGELOG_FILE 段
+  CHANGELOG_BODY="$(awk '
+    $0 == "MARK_CHANGELOG_FILE" { capture=1; next }
+    capture && $0 == "MARK_END" { exit }
+    capture { print }
+  ' <<<"$PARSED")"
+
+  [[ -z "$CHANGELOG_BODY" ]] && die "共享生成器输出为空, 检查 git 区间是否有效"
+  echo "$CHANGELOG_BODY" > "$NOTES_FILE"
 fi
 
 # ---------- 解析 assets ----------
@@ -312,7 +279,13 @@ log "Release 状态预检:"
 echo "    Tag         : $TAG"
 echo "    Exists      : $RELEASE_EXISTS"
 echo "    Assets      : $ASSET_COUNT"
-echo "    Aggregated  : ${#COLLECTED_TAGS[@]} tag(s) -> ${COLLECTED_TAGS[*]}"
+if $SINGLE; then
+  echo "    Mode        : --single (单文件 docs/changelog/${TAG}.md)"
+elif [[ -n "$START_TAG" ]]; then
+  echo "    Range       : ${START_TAG} → ${TAG}"
+else
+  echo "    Range       : (initial) → ${TAG}"
+fi
 echo "    Notes file  : $NOTES_FILE ($(wc -l <"$NOTES_FILE" | tr -d ' ') lines)"
 echo "    Draft       : $DRAFT"
 echo "    Prerelease  : $PRERELEASE"
