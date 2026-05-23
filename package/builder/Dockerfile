@@ -9,6 +9,8 @@ RUN python -m pip install --upgrade pip 'setuptools<70'
 RUN pip install wheel cython pyinstaller==5.7.0
 RUN git clone --depth=1 -b ${branch} https://github.com/joneezhu/NasTools --recurse-submodule /nas-tools
 WORKDIR /nas-tools
+# fast-bencode==1.1.3 是上古 sdist, 必须复用外层 setuptools<70, 否则 pip overlay 会拉最新 setuptools 把钉的版本架空
+RUN pip install --no-build-isolation 'fast-bencode==1.1.3'
 RUN pip install -r package/requirements.txt
 RUN pip install pyparsing
 RUN cp ./package/rely/hook-cn2an.py ${py_site_packages}/PyInstaller/hooks/ && \

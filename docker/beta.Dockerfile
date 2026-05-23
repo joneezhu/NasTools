@@ -17,9 +17,11 @@ RUN set -xe \
     && if [ "$(uname -m)" = "x86_64" ]; then ARCH=amd64; elif [ "$(uname -m)" = "aarch64" ]; then ARCH=arm64; fi \
     && curl https://dl.min.io/client/mc/release/linux-${ARCH}/mc --create-dirs -o /usr/bin/mc \
     && chmod +x /usr/bin/mc \
-    # fast-bencode==1.1.3 是上古 sdist, 不兼容 setuptools 70+, 必须钉死
-    && pip install --upgrade pip 'setuptools<70' wheel \
-    && pip install cython \
+    # fast-bencode==1.1.3 是上古 sdist, 不兼容 setuptools 70+
+    # 必须先钉死外层 setuptools<70, 再用 --no-build-isolation 让 fast-bencode 复用外层环境
+    # (默认 pip 会给每个 sdist 单独建 overlay 装最新 setuptools, 把我们钉的版本架空)
+    && pip install --upgrade pip 'setuptools<70' wheel cython \
+    && pip install --no-build-isolation 'fast-bencode==1.1.3' \
     && pip install -r https://raw.githubusercontent.com/joneezhu/NasTools/beta/requirements.txt \
     && apk del --purge .build-deps \
     && rm -rf /tmp/* /root/.cache /var/cache/apk/*
