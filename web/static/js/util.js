@@ -312,44 +312,88 @@ function sleep(ms) {
 }
 
 /**
- * 比较版本号大小，v1大于v2时返回1，相等返回0，否则返回-1
+ * 比较版本号大小, v1 大于 v2 时返回 1, 相等返回 0, 小于返回 -1, 主版本相同 commit 不同返回 2
+ *
+ * 支持的格式:
+ *   "v3.4.1"
+ *   "v3.4.2-beta.1"   pre-release (alpha < beta < rc < 正式版)
+ *   "v3.4.2-rc.2"
+ *   "v3.4.1 a112487"  附带 commit 短哈希
+ *
+ * SemVer 关键规则:
+ *   - 正式版 > 任意 pre-release: v3.4.2 > v3.4.2-beta.5 > v3.4.2-beta.1 > v3.4.2-alpha.1
+ *   - pre-release 标识符按字典序: alpha < beta < rc
+ *   - 同 pre-release 类型按数字: beta.5 > beta.1
  */
 function compareVersion(version1, version2) {
-  version1 = version1.split(' ');
-  version2 = version2.split(' ');
-  const c1 = version1[1];
-  const c2 = version2[1];
-  const v1 = version1[0].replace('v', '').split('.');
-  const v2 = version2[0].replace('v', '').split('.');
+  // 分离 commit 短哈希 (空格分隔)
+  const parts1 = String(version1 || '').trim().split(/\s+/);
+  const parts2 = String(version2 || '').trim().split(/\s+/);
+  const c1 = parts1[1] || '';
+  const c2 = parts2[1] || '';
+
+  // 拆分主版本与 pre-release 后缀: "3.4.2-beta.1" -> ["3.4.2", "beta.1"]
+  const split = (raw) => {
+    const s = String(raw || '').replace(/^v/i, '');
+    const dashIdx = s.indexOf('-');
+    if (dashIdx < 0) return { core: s, pre: '' };
+    return { core: s.slice(0, dashIdx), pre: s.slice(dashIdx + 1) };
+  };
+  const a = split(parts1[0]);
+  const b = split(parts2[0]);
+
+  // 主版本号逐位比较
+  const v1 = a.core.split('.');
+  const v2 = b.core.split('.');
   const len = Math.max(v1.length, v2.length);
-
-  while (v1.length < len) {
-    v1.push('0');
-  }
-  while (v2.length < len) {
-    v2.push('0');
-  }
-
+  while (v1.length < len) v1.push('0');
+  while (v2.length < len) v2.push('0');
   for (let i = 0; i < len; i++) {
-    const num1 = parseInt(v1[i]);
-    const num2 = parseInt(v2[i]);
-
-    if (num1 > num2) {
-      return 1;
-    } else if (num1 < num2) {
-      return -1;
-    }
+    const num1 = parseInt(v1[i], 10) || 0;
+    const num2 = parseInt(v2[i], 10) || 0;
+    if (num1 > num2) return 1;
+    if (num1 < num2) return -1;
   }
 
-  if (c1 && c2) {
-    if (c1 === c2) {
-      return 0;
-    } else {
-      return 2;
-    }
-  } else {
+  // 主版本相同时, 处理 pre-release: 没 pre 的视为正式版, 大于任何 pre-release
+  if (a.pre === '' && b.pre === '') {
+    // 两边都是正式版, 比 commit
+    if (c1 && c2) return c1 === c2 ? 0 : 2;
     return 0;
   }
+  if (a.pre === '' && b.pre !== '') return 1;   // v1 是正式版 > v2 的 pre
+  if (a.pre !== '' && b.pre === '') return -1;  // v1 是 pre < v2 的正式版
+
+  // 双方都有 pre, 按 SemVer 逐段比较
+  // "beta.1" -> ["beta", "1"]; 数字段按数字, 文本段按字典序; 数字 < 文本
+  const p1 = a.pre.split('.');
+  const p2 = b.pre.split('.');
+  const pLen = Math.max(p1.length, p2.length);
+  for (let i = 0; i < pLen; i++) {
+    const x = p1[i];
+    const y = p2[i];
+    if (x === undefined) return -1;  // 短的 pre 较小: beta < beta.1
+    if (y === undefined) return 1;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      const xi = parseInt(x, 10);
+      const yi = parseInt(y, 10);
+      if (xi > yi) return 1;
+      if (xi < yi) return -1;
+    } else if (xn && !yn) {
+      return -1;  // 数字段 < 文本段
+    } else if (!xn && yn) {
+      return 1;
+    } else {
+      if (x > y) return 1;
+      if (x < y) return -1;
+    }
+  }
+
+  // pre 完全相同, 比 commit
+  if (c1 && c2) return c1 === c2 ? 0 : 2;
+  return 0;
 }
 
 
