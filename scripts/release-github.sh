@@ -17,7 +17,16 @@
 #   scripts/release-github.sh <tag> --latest              # 标记为 latest (默认会自动判断)
 #   scripts/release-github.sh <tag> --assets=path1,path2  # 上传本地附件
 #   scripts/release-github.sh <tag> --force-recreate      # 删除现有 Release 后重建 (会丢失 assets)
+#   scripts/release-github.sh <tag> --single              # 仅用当前 tag 的 changelog (不聚合中间漏发的 tag)
+#   scripts/release-github.sh <tag> --since=vX.Y.Z        # 强制指定起点 tag, 聚合 (since, tag] 区间
 #   scripts/release-github.sh <tag> --dry-run             # 只打印不执行
+#
+# Release body 聚合策略 (默认):
+#   * 自动找出"上一个已发布的 GitHub Release"作为起点 (LAST_RELEASED)
+#   * 收集 git tag 中 LAST_RELEASED < t <= <tag> 的所有 tag, 把对应的
+#     docs/changelog/<t>.md 按版本号倒序合并 (新版本在前)
+#   * 这样即使中间有 tag 没单独建 Release, 它们的 changelog 也会一起呈现
+#   * 想退回到原行为 (仅当前 tag) 加 --single, 想强制起点加 --since=vX.Y.Z
 #
 # 凭据:
 #   .release 文件中的 RELEASE_GH_TOKEN 会被加载到 GH_TOKEN 供 gh CLI 使用。
@@ -42,6 +51,8 @@ PRERELEASE=false
 LATEST_FLAG=""    # "" / "--latest=true" / "--latest=false"
 ASSETS=""
 FORCE_RECREATE=false
+SINGLE=false
+SINCE_TAG=""
 shift || true
 for arg in "$@"; do
   case "$arg" in
@@ -52,11 +63,13 @@ for arg in "$@"; do
     --no-latest)      LATEST_FLAG="--latest=false" ;;
     --assets=*)       ASSETS="${arg#*=}" ;;
     --force-recreate) FORCE_RECREATE=true ;;
+    --single)         SINGLE=true ;;
+    --since=*)        SINCE_TAG="${arg#*=}" ;;
     *) die "未知参数: $arg" ;;
   esac
 done
 
-[[ -z "$TAG" ]] && die "用法: $0 <tag> [--draft] [--prerelease] [--assets=a,b] [--force-recreate] [--dry-run]"
+[[ -z "$TAG" ]] && die "用法: $0 <tag> [--draft] [--prerelease] [--single] [--since=vX.Y.Z] [--assets=a,b] [--force-recreate] [--dry-run]"
 [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] \
   || die "tag 格式应为 vX.Y.Z 或 vX.Y.Z-suffix, 实际: $TAG"
 
@@ -116,6 +129,150 @@ if ! git ls-remote --tags --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; t
   die "远端 origin 上不存在 tag $TAG, 请先 git push origin $TAG"
 fi
 
+# ---------- 聚合 changelog (默认行为) ----------
+# 找出 (起点 tag, $TAG] 区间内所有有 changelog 文件的 tag, 合并为一份 notes
+# 起点 tag 选取顺序:
+#   1) 命令行 --since=vX.Y.Z 指定
+#   2) 自动: 取上一个已存在的 GitHub Release 的 tagName (语义版本 < $TAG 中最大的)
+#   3) 都没有 -> 起点为空, 收集所有 <= $TAG 的 tag
+
+# 计算起点 tag
+START_TAG=""
+if [[ -n "$SINCE_TAG" ]]; then
+  START_TAG="$SINCE_TAG"
+  log "起点 tag (来自 --since): $START_TAG"
+elif $SINGLE; then
+  log "--single 模式: 仅使用 $TAG 自身的 changelog"
+else
+  # 通过 gh 列出所有 release, 找语义版本严格小于 $TAG 的最大那个
+  # gh release list 默认按时间倒序, 我们按 tagName 自行排序更稳健
+  set +e
+  RELEASES_JSON="$(gh release list --limit 100 --json tagName,isDraft 2>/dev/null)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 && -n "$RELEASES_JSON" && "$RELEASES_JSON" != "[]" ]]; then
+    START_TAG="$(TARGET_TAG="$TAG" RELEASES_JSON="$RELEASES_JSON" python3 <<'PYEOF'
+import os, json, re
+target = os.environ.get("TARGET_TAG", "")
+raw    = os.environ.get("RELEASES_JSON", "[]")
+def vkey(t):
+    # vX.Y.Z[-suffix] -> (X, Y, Z, 0=有后缀/1=正式) 让 v3.4.2 > v3.4.2-rc.1
+    m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$', t)
+    if not m: return None
+    x, y, z, suf = int(m[1]), int(m[2]), int(m[3]), m[4]
+    return (x, y, z, 0 if suf else 1, suf or "")
+data = json.loads(raw)
+tk = vkey(target)
+candidates = []
+for r in data:
+    if r.get("isDraft"): continue
+    name = r.get("tagName", "")
+    k = vkey(name)
+    if k and tk and k < tk:
+        candidates.append((k, name))
+if candidates:
+    candidates.sort()
+    print(candidates[-1][1])
+PYEOF
+)"
+    if [[ -n "$START_TAG" ]]; then
+      log "起点 tag (来自上一个 GitHub Release): $START_TAG"
+    else
+      log "未找到比 $TAG 更早的已发布 Release, 将聚合所有 <= $TAG 的 changelog"
+    fi
+  else
+    log "尚无任何 GitHub Release, 将聚合所有 <= $TAG 的 changelog"
+  fi
+fi
+
+# 收集要聚合的 tag 列表 (区间: START_TAG 排除, TAG 包含)
+COLLECTED_TAGS=()
+if $SINGLE; then
+  COLLECTED_TAGS=("$TAG")
+else
+  # 列出所有 docs/changelog/v*.md 中存在的 tag, 用 python 过滤区间并按版本倒序
+  ALL_CHANGELOG_TAGS="$(ls "$REPO_ROOT/docs/changelog/" 2>/dev/null | sed -nE 's/^(v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)\.md$/\1/p')"
+  if [[ -z "$ALL_CHANGELOG_TAGS" ]]; then
+    die "docs/changelog/ 下没有可用的 v*.md 文件"
+  fi
+  # 通过环境变量把列表传给 python (避免 heredoc + <<< 嵌套出问题)
+  COLLECTED_RAW="$(TARGET_TAG="$TAG" START_TAG="$START_TAG" ALL_TAGS="$ALL_CHANGELOG_TAGS" python3 <<'PYEOF'
+import os, re
+target = os.environ.get("TARGET_TAG", "")
+start  = os.environ.get("START_TAG", "")
+raw    = os.environ.get("ALL_TAGS", "")
+def vkey(t):
+    m = re.match(r'^v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$', t)
+    if not m: return None
+    x, y, z, suf = int(m[1]), int(m[2]), int(m[3]), m[4]
+    return (x, y, z, 0 if suf else 1, suf or "")
+tk = vkey(target)
+sk = vkey(start) if start else None
+out = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line: continue
+    k = vkey(line)
+    if not k: continue
+    if tk and k > tk: continue
+    if sk and k <= sk: continue
+    out.append((k, line))
+out.sort(reverse=True)  # 新版本在前
+for _, t in out:
+    print(t)
+PYEOF
+)"
+  # shellcheck disable=SC2207
+  IFS=$'\n' COLLECTED_TAGS=( $COLLECTED_RAW )
+  unset IFS
+fi
+
+[[ ${#COLLECTED_TAGS[@]} -eq 0 ]] \
+  && die "聚合后的 tag 列表为空, 检查 docs/changelog/ 与 --since/--single 参数"
+
+log "聚合 changelog 顺序 (新→旧): ${COLLECTED_TAGS[*]}"
+
+# 生成聚合后的 notes 文件
+NOTES_FILE="$(mktemp -t release-notes.XXXXXX.md)"
+trap 'rm -f "$NOTES_FILE"' EXIT
+
+if [[ ${#COLLECTED_TAGS[@]} -eq 1 ]]; then
+  # 只有一个 tag, 直接用它的文件 (保持简洁, 不加聚合头)
+  cat "$REPO_ROOT/docs/changelog/${COLLECTED_TAGS[0]}.md" > "$NOTES_FILE"
+else
+  # 多 tag 聚合: 用 $TAG 自身文件作主体, 并把中间漏发的旧 tag 内容追加在 "Previous unreleased changes" 段
+  {
+    cat "$REPO_ROOT/docs/changelog/${TAG}.md"
+    echo
+    echo "---"
+    echo
+    echo "## 📚 Included previous changes"
+    echo
+    if [[ -n "$START_TAG" ]]; then
+      echo "> 本次发布同时包含 \`$START_TAG\` 之后所有未单独建 Release 的 tag 变更，按版本倒序合并："
+    else
+      echo "> 本次发布包含所有历史 tag 的变更（之前从未建过 Release），按版本倒序合并："
+    fi
+    echo
+    # 跳过第一个 (就是 $TAG 自身), 拼接其余
+    for t in "${COLLECTED_TAGS[@]:1}"; do
+      f="$REPO_ROOT/docs/changelog/${t}.md"
+      if [[ ! -f "$f" ]]; then
+        warn "缺失 $f, 跳过"
+        continue
+      fi
+      echo
+      echo "<details>"
+      echo "<summary><strong>$t</strong> (展开查看)</summary>"
+      echo
+      # 文件原内容里 H1 是 "# Release vX", 在 details 里降级到 H3 防破坏当前 H2 层级
+      sed -E 's/^# Release /### Release /' "$f"
+      echo
+      echo "</details>"
+    done
+  } > "$NOTES_FILE"
+fi
+
 # ---------- 解析 assets ----------
 ASSET_ARGS=()
 if [[ -n "$ASSETS" ]]; then
@@ -145,7 +302,7 @@ OWNER_REPO="$(git config --get remote.origin.url | sed -E 's#.*github.com[:/](.*
 RELEASE_URL="https://github.com/${OWNER_REPO}/releases/tag/${TAG}"
 
 # ---------- 组装 gh release 参数 ----------
-GH_ARGS=( --title "$TAG" --notes-file "$CHANGELOG_FILE" )
+GH_ARGS=( --title "$TAG" --notes-file "$NOTES_FILE" )
 $DRAFT      && GH_ARGS+=( --draft )
 $PRERELEASE && GH_ARGS+=( --prerelease )
 [[ -n "$LATEST_FLAG" ]] && GH_ARGS+=( "$LATEST_FLAG" )
@@ -155,7 +312,8 @@ log "Release 状态预检:"
 echo "    Tag         : $TAG"
 echo "    Exists      : $RELEASE_EXISTS"
 echo "    Assets      : $ASSET_COUNT"
-echo "    Changelog   : docs/changelog/${TAG}.md ($(wc -l <"$CHANGELOG_FILE" | tr -d ' ') lines)"
+echo "    Aggregated  : ${#COLLECTED_TAGS[@]} tag(s) -> ${COLLECTED_TAGS[*]}"
+echo "    Notes file  : $NOTES_FILE ($(wc -l <"$NOTES_FILE" | tr -d ' ') lines)"
 echo "    Draft       : $DRAFT"
 echo "    Prerelease  : $PRERELEASE"
 [[ ${#ASSET_ARGS[@]} -gt 0 ]] && echo "    Local assets: ${ASSET_ARGS[*]}"
@@ -165,13 +323,16 @@ echo
 if $DRY_RUN; then
   warn "--dry-run, 仅打印计划:"
   if $RELEASE_EXISTS && ! $FORCE_RECREATE; then
-    echo "    gh release edit \"$TAG\" --notes-file \"$CHANGELOG_FILE\" --title \"$TAG\""
+    echo "    gh release edit \"$TAG\" --notes-file \"$NOTES_FILE\" --title \"$TAG\""
   elif $RELEASE_EXISTS && $FORCE_RECREATE; then
     echo "    gh release delete \"$TAG\" --yes"
     echo "    gh release create \"$TAG\" ${GH_ARGS[*]} ${ASSET_ARGS[*]:-}"
   else
     echo "    gh release create \"$TAG\" ${GH_ARGS[*]} ${ASSET_ARGS[*]:-}"
   fi
+  echo
+  log "聚合后的 notes 内容预览 (前 40 行):"
+  head -40 "$NOTES_FILE" | sed 's/^/    /'
   exit 0
 fi
 
@@ -188,7 +349,7 @@ if $RELEASE_EXISTS; then
     fi
   else
     log "Release $TAG 已存在, 仅更新 title/body (保留 $ASSET_COUNT 个 assets)..."
-    EDIT_ARGS=( --title "$TAG" --notes-file "$CHANGELOG_FILE" )
+    EDIT_ARGS=( --title "$TAG" --notes-file "$NOTES_FILE" )
     $DRAFT      && EDIT_ARGS+=( --draft=true )      || EDIT_ARGS+=( --draft=false )
     $PRERELEASE && EDIT_ARGS+=( --prerelease=true ) || EDIT_ARGS+=( --prerelease=false )
     gh release edit "$TAG" "${EDIT_ARGS[@]}"

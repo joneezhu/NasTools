@@ -4,7 +4,7 @@
 > 文档编写：2026-05-18
 > 适用范围：维护者 / 发布工程师 / 自建分发渠道用户
 
-本文档定义了 NAStool 项目的 **版本号规范、发布流程、构建产物、回滚方案** 与 **后续发布检查清单**。日常使用请参考 `USAGE.md`，版本变更明细请参考 `CHANGELOG.md`。
+本文档定义了 NAStool 项目的 **版本号规范、发布流程、构建产物、回滚方案** 与 **后续发布检查清单**。日常使用请参考 `USAGE.md`，版本变更明细请参考 [`docs/changelog/`](./changelog/) 目录下的单 tag 文件。
 
 ---
 
@@ -65,8 +65,8 @@ nastool_<platform>_v<version>[.exe]
 - [ ] `requirements.txt` 已锁定版本，且全部依赖在 PyPI 可正常拉取
 - [ ] `package_list.txt` / `package_list_debian.txt` 已更新（如有系统包变更）
 - [ ] `scripts/versions/` 下的 Alembic 迁移脚本已新增并自测
-- [ ] `version.py` 的 `APP_VERSION` 已更新
-- [ ] `CHANGELOG.md` 已补充本次变更条目
+- [ ] `version.py` 的 `APP_VERSION` 已更新（如手动改；用 `release.sh` 时自动）
+- [ ] `docs/changelog/<tag>.md` 已生成（`release.sh` 自动生成）
 - [ ] `tests/` 全部通过（`python3 -m unittest discover tests`）
 - [ ] 关键路径手工冒烟（启动、登录、订阅、识别、转移、下载器对接）
 - [ ] Docker 镜像在 amd64 / arm64 双架构构建成功
@@ -107,7 +107,7 @@ nastool_<platform>_v<version>[.exe]
 
 `scripts/release.sh` 通过 GitHub 官方 [`gh` CLI](https://cli.github.com/) 完成两件事：
 
-1. 触发 `build.yml` / `build-beta.yml` / `build-package.yml` 三条 GitHub Actions 流水线
+1. 触发 `build.yml`（Docker Hub，含 stable / beta 两通道）与 `build-package.yml`（二进制 + GitHub Release）两条流水线
 2. 调用 `gh release view` 判断目标 tag 是否已发布安装包（幂等行为依赖此能力）
 
 未安装 `gh` 时脚本会拒绝执行，请按所在平台安装：
@@ -208,8 +208,8 @@ gh auth status
 # 期望: ✓ Logged in to github.com as <你的账号> ...
 
 # 进一步验证有触发 workflow 的权限
-gh workflow list -R joneechua/NasTools
-# 应能看到 build.yml / build-beta.yml / build-package.yml
+gh workflow list -R joneezhu/NasTools
+# 应能看到 build.yml / build-package.yml
 ```
 
 > Token 权限要求：fine-grained PAT 需要 **Contents: Read and write** + **Actions: Read and write**；classic PAT 需要 `repo` + `workflow` scope。详见 token 章节。
@@ -229,14 +229,14 @@ cp .release.example .release
 # 演练（推荐先跑一次确认 CHANGELOG 内容）
 scripts/release.sh v3.4.2 --dry-run
 
-# 正式发布（自动加载 .release, push + 触发流水线）
+# 正式发布（默认 *不* 触发 CI，仅生成 commit/tag/changelog 并 push）
 scripts/release.sh v3.4.2
+
+# 发布并立刻触发 docker / package 流水线（ref 一律指向新 tag）
+scripts/release.sh v3.4.2 --build
 
 # 仅本地操作（不 push、不触发 CI，调试用）
 scripts/release.sh v3.4.2 --no-push
-
-# 只想打 tag 不触发 CI（无需 .release）
-scripts/release.sh v3.4.2 --no-build
 
 # Tag message 不使用 emoji（兼容老旧 git 客户端）
 scripts/release.sh v3.4.2 --no-emoji
@@ -244,6 +244,10 @@ scripts/release.sh v3.4.2 --no-emoji
 # 调整 tag message 中变更条目上限（默认 12）
 scripts/release.sh v3.4.2 --tag-limit=20
 ```
+
+> **为什么默认不触发 CI**：避免误触发；同时给"先看 commit/tag 推上去是否正确"留出确认时间。需要触发时只要再跑一次 `scripts/release.sh <tag> --build`（脚本会进入"仅重跑打包"路径，只触发 build-package.yml）。
+>
+> **为什么 `--build` 用 tag 作 ref**：`gh workflow run --ref <tag>` 比 `--ref master` 更精确——`build-package.yml` 里 `softprops/action-gh-release@v1` 会把 Release 绑定到 ref 对应的 tag；用分支名时若分支后续有新 commit，ref 会漂移。
 
 #### Tag message 格式
 
@@ -276,12 +280,12 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 
 1. 收集 **上一个 tag → HEAD** 的 commit，过滤噪声（merge / wip / typo / chore: lint 等），按前缀分类为 Added / Changed / Fixed / Removed / Breaking / Security / Deprecated
 2. 同标题去重，自动剥离 `feat:` / `fix(scope):` 等约定式前缀
-3. 在 `docs/CHANGELOG.md` 的 `[Unreleased]` 之后插入新版本节，并把 `[Unreleased]` 重置为模板
+3. 把当次变更写入 `docs/changelog/<tag>.md`（**唯一的 changelog 落地点**，不再修改 `docs/CHANGELOG.md` 总账）
 4. 修改 `version.py` 中的 `APP_VERSION`
 5. 创建 `release: bump version to vX.Y.Z` commit，附带 5 条核心修改点
 6. 打 annotated tag，tag message 内嵌结构化变更摘要（标题区 + 类目分组 + emoji 图标，默认上限 12 条，可用 `--tag-limit=N` 调整）
 7. push master + tag 到远端
-8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub）与 `build-package.yml`（二进制 + Release）
+8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub，默认 channel=stable）与 `build-package.yml`（二进制 + Release）
 
 #### 幂等行为（可重入）
 
@@ -289,7 +293,7 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 
 | 场景 | tag 是否存在 | GitHub Release 安装包 | 行为 |
 |------|------------|----------------------|------|
-| A | ❌ 不存在 | — | 走完整流程（生成 changelog → 改 version → commit → tag → push → 触发三条流水线） |
+| A | ❌ 不存在 | — | 走完整流程（生成 changelog → 改 version → commit → tag → push → 触发 build.yml + build-package.yml 流水线） |
 | B | ✅ 存在 | ✅ 至少 1 个 asset | 直接退出，提示 Release 链接（无事可做） |
 | C | ✅ 存在 | ❌ 缺失 | 跳过 commit/tag/push，**仅基于已有 tag 重跑 `build-package.yml`** 出包 |
 
@@ -299,7 +303,7 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 
 #### 4.2.4 单 tag changelog 文件（`docs/changelog/<tag>.md`）
 
-每次 `release.sh` 在更新 `docs/CHANGELOG.md` 总账之外，会同时把当前版本的变更**单独**写入：
+自 v3.4.x 起，**`docs/CHANGELOG.md` 不再被脚本写入**（只作为静态导览页保留）。每次 `release.sh` 把当前版本的变更**只**写入：
 
 ```
 docs/changelog/<tag>.md      # 例如 docs/changelog/v3.4.3.md
@@ -313,30 +317,39 @@ docs/changelog/<tag>.md      # 例如 docs/changelog/v3.4.3.md
 - **Date**: 2026-05-23
 - **Range**: v3.4.2 → v3.4.3
 - **Commits**: 5 kept / 7 total
+- **Compare**: [v3.4.2...v3.4.3](https://github.com/<owner>/<repo>/compare/v3.4.2...v3.4.3)
 
 ---
 
 ## Added
-- 新增 X 功能 (abc1234)
+- 新增 X 功能 ([#101](https://github.com/<owner>/<repo>/issues/101)) ([`abc1234`](https://github.com/<owner>/<repo>/commit/abc1234...))
 ...
 ```
 
+**超链接自动生成**：脚本会从 `git remote.origin.url` 解析出 `owner/repo`，把 commit 短哈希链化为 commit URL，把正文里的 `#123` / `GH-123` 链化为 issue URL，并在文件头追加一条 `Compare` 链接（指向上一个 tag 到本 tag 的差异页）。git annotated tag message 仍保持纯文本（git 不渲染 markdown）。
+
 它存在的目的：
 
-1. **GitHub Release body 来源**：`scripts/release-github.sh` 直接把它作为 `--notes-file` 传给 `gh release create/edit`，比 `build-package.yml` 里默认用 commit message 当 body 的方式可读得多。
-2. **可单独引用**：可在 issue / PR / 通告里链接到 `https://github.com/<owner>/<repo>/blob/master/docs/changelog/v3.4.3.md`，无需翻 CHANGELOG.md 大文件。
+1. **GitHub Release body 来源**：`scripts/release-github.sh` 直接把它作为 `--notes-file` 传给 `gh release create/edit`。
+2. **可单独引用**：可在 issue / PR / 通告里链接到 `https://github.com/<owner>/<repo>/blob/master/docs/changelog/v3.4.3.md`。
 3. **CI 友好**：未来若要把 release notes 推送到外部渠道（论坛 / Telegram / 邮件订阅），脚本可直接读这个文件。
 
 文件由 `release.sh` 自动生成并随 `release: bump version to vX.Y.Z` 一起 commit & tag。**不要手动修改已发布版本的文件**；如要修订内容，应通过下面的 `release-github.sh` 重新刷 GitHub Release body 即可（仓库内的历史保留原版）。
 
 #### 4.2.5 创建 / 更新 GitHub Release（`scripts/release-github.sh`）
 
-`build-package.yml` 流水线在打包成功后会自动创建 Release，但 body 用的是 commit message，不够正式。`scripts/release-github.sh` 用于：
+`build-package.yml` 流水线在打包成功后会自动创建 Release **并上传 6 个平台的二进制 assets**，但**不再写 title/body**（自 v3.4.x 起的职责调整：CI 只管 assets，body 全权交给本地脚本）。`scripts/release-github.sh` 用于：
 
+- **写入 / 替换 body**：把 Release 描述刷成 `docs/changelog/<tag>.md` 的标准格式（CI 创建出来时 body 是空的，需要本地脚本填）
 - **首次创建**：CI 因故没建出 Release 时，本地直接 `create`
-- **替换 body**：把 Release 描述刷成 `docs/changelog/<tag>.md` 的标准格式
 - **追加 assets**：上传额外文件（SHA256 校验、补丁包等），不冲掉原有 assets
 - **预发布标记**：tag 含 `-beta.1` / `-rc.1` 等后缀时自动判定为 prerelease
+- **聚合中间漏发的 changelog**：默认会从"上一个已发布的 GitHub Release"开始往后找，把这之间所有 tag 的 changelog 合并到本次 Release body（详见下方"Body 聚合策略"）
+
+> **职责分工（重要）**
+> - `build-package.yml` 的 `Create-release_Send-message` job：只 `tag_name + files`，不写 `name` 和 `body`，避免覆盖本地脚本写入的内容
+> - `scripts/release-github.sh`：默认走 `gh release edit --notes-file`，只刷 title/body，**保留 CI 上传的 assets**
+> - `--force-recreate` 会先 delete + create，**会丢掉 assets**，需要重跑 build-package.yml 补回（对应下面的幂等场景 C）
 
 ##### 用法
 
@@ -344,7 +357,7 @@ docs/changelog/<tag>.md      # 例如 docs/changelog/v3.4.3.md
 # 1) 最常见：基于 docs/changelog/v3.4.3.md 创建/更新 Release
 scripts/release-github.sh v3.4.3
 
-# 2) 预演不执行
+# 2) 预演不执行（推荐先跑一次确认聚合范围与内容）
 scripts/release-github.sh v3.4.3 --dry-run
 
 # 3) 创建为 draft (人工 review 后再发布)
@@ -358,15 +371,38 @@ scripts/release-github.sh v3.4.3 --assets=releases/SHA256SUMS.txt,releases/notes
 
 # 6) 强制重建 Release (会丢失原有 assets, 谨慎使用)
 scripts/release-github.sh v3.4.3 --force-recreate
+
+# 7) 仅用当前 tag 自身的 changelog (不聚合中间漏发的 tag)
+scripts/release-github.sh v3.4.3 --single
+
+# 8) 强制指定起点 tag, 聚合 (since, tag] 区间
+scripts/release-github.sh v3.4.5 --since=v3.4.2
 ```
 
 ##### 行为说明
 
 | 远端 Release 状态 | 默认行为 | 说明 |
 |------------------|---------|------|
-| 不存在 | `gh release create` | 用单 tag changelog 作 body |
+| 不存在 | `gh release create` | 用聚合后的 changelog 作 body |
 | 已存在 | `gh release edit` | **仅更新 title / body**，保留所有 assets |
 | 已存在 + `--force-recreate` | `delete` 然后 `create` | 会丢失现有 assets，仅在确实需要重建时使用 |
+
+##### Body 聚合策略
+
+发版到 GitHub 上的 Release 不一定是连续的——可能 v3.4.2、v3.4.3 都打了 tag 但只有 v3.4.4 才决定建 Release。这时如果只把 v3.4.4 的 changelog 当 body，用户就看不到中间两个版本的变更。
+
+所以 `release-github.sh` 默认会做**区间聚合**：
+
+1. 通过 `gh release list` 拉取所有已存在的 Release，找出**语义版本严格小于 `<tag>`** 的最近一个，记为 `START_TAG`（也就是"上一个已发布到 GitHub Releases 的 tag"）。如果一个都没有，`START_TAG` 为空。
+2. 在 `docs/changelog/v*.md` 里挑出所有满足 `START_TAG < t <= <tag>` 的文件，按版本号**倒序**（新→旧）。
+3. 用 `<tag>` 自己的文件作主体，剩下的旧 tag 内容塞到 `## 📚 Included previous changes` 段，每个用 `<details>` 折叠包裹（避免页面太长）。
+
+**这样无论你跳几个版本才建 Release，body 里都能看到完整的变更历史。**
+
+跳过聚合：
+
+- `--single`：明确说"我只要这一个 tag 的 changelog"，跳过所有聚合逻辑
+- `--since=vA.B.C`：手动指定起点（替换自动从 GitHub Release 推断的逻辑）
 
 ##### 前置条件
 
@@ -377,12 +413,13 @@ scripts/release-github.sh v3.4.3 --force-recreate
 ##### 与 `release.sh` 的协作
 
 ```
-release.sh vX.Y.Z              # 生成 changelog / 打 tag / 触发 CI
+release.sh vX.Y.Z              # 生成 changelog / 打 tag / push (默认不触发 CI)
         │
-        ├── CI 跑完: build-package.yml 自动创建 Release + 上传 assets
+        ├── 需要构建产物时: release.sh vX.Y.Z --build
+        │       └── CI 跑完: build-package.yml 自动创建 Release + 上传 assets
         │
-        └── 想美化 body 时:
-            release-github.sh vX.Y.Z   # 把 body 替换成 docs/changelog/vX.Y.Z.md
+        └── 想美化 body / 想聚合中间漏发的 tag 时:
+            release-github.sh vX.Y.Z   # body 用 docs/changelog/vX.Y.Z.md (+ 中间漏发的旧 tag)
 ```
 
 如果 CI 还没跑完就先想建 Release（例如只做 source release），直接 `release-github.sh vX.Y.Z` 也可以——它会以 `create` 模式跑，等 CI 跑到上传 asset 那一步就会把附件加到这个已存在的 Release 上。
@@ -405,12 +442,12 @@ git checkout -b release/v3.4.2
 APP_VERSION = 'v3.4.2'
 ```
 
-在 `CHANGELOG.md` 顶部新增本次条目（具体格式见 `CHANGELOG.md`）。
+在 `docs/changelog/<tag>.md` 中新建本次变更（推荐直接使用 `scripts/release.sh` 自动生成；手动撰写时格式参考已有版本文件）。
 
 提交：
 
 ```bash
-git add version.py CHANGELOG.md
+git add version.py docs/changelog/v3.4.2.md
 git commit -m "release: bump version to v3.4.2"
 ```
 
@@ -479,7 +516,7 @@ mv dist/nastool dist/nastool_linux_v3.4.2
 
 - **Tag**：`v3.4.2`
 - **Title**：`v3.4.2 - <一句话标题>`
-- **Body**：粘贴 `CHANGELOG.md` 中本版本对应章节
+- **Body**：粘贴 `docs/changelog/<tag>.md` 内容（或直接用 `scripts/release-github.sh` 自动同步）
 - **Attachments**：上传 PyInstaller 三平台二进制
 - 勾选「Set as the latest release」（正式版），或「Set as a pre-release」（rc / beta）
 
@@ -558,7 +595,7 @@ docker push joneezhu/NasTools:v3.4.2
 
 ```
 □ version.py 版本号已更新
-□ CHANGELOG.md 顶部已新增条目
+□ docs/changelog/<tag>.md 已生成（release.sh 自动）
 □ 所有 P0/P1 Bug 已闭环
 □ requirements.txt 已锁定 + Pip Audit
 □ package_list*.txt 已同步

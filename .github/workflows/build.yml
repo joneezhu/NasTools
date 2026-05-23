@@ -1,4 +1,9 @@
 name: NAStool Docker
+# 合并自原 build.yml + build-beta.yml (2026-05-23)
+# 通过 channel 输入选择构建哪些镜像:
+#   - stable: Alpine + Debian       (tag: <ver> / latest / <ver>-debian / debian)
+#   - beta:   Alpine-beta + Debian-beta (tag: <ver>-beta / beta / <ver>-debian-beta / debian-beta)
+#   - both:   四种全跑
 on:
   workflow_dispatch:
     inputs:
@@ -10,107 +15,100 @@ on:
         description: 'docker user password'
         required: true
         default: ''
+      channel:
+        description: '发布通道 (stable / beta / both)'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - beta
+          - both
 
 jobs:
-  alpine:
+  build:
     runs-on: ubuntu-latest
-    name: Build Docker Image (Alpine)
+    name: Build Docker Image (${{ matrix.flavor.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor:
+          - name: Alpine
+            channel: stable
+            dockerfile: docker/Dockerfile
+            version_suffix: ''
+            extra_tag: latest
+          - name: Debian
+            channel: stable
+            dockerfile: docker/debian.Dockerfile
+            version_suffix: '-debian'
+            extra_tag: debian
+          - name: Alpine-Beta
+            channel: beta
+            dockerfile: docker/beta.Dockerfile
+            version_suffix: '-beta'
+            extra_tag: beta
+          - name: Debian-Beta
+            channel: beta
+            dockerfile: docker/debian-beta.Dockerfile
+            version_suffix: '-debian-beta'
+            extra_tag: debian-beta
     steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v3
+      - name: Channel filter
+        id: filter
+        run: |
+          ch="${{ github.event.inputs.channel }}"
+          flavor_ch="${{ matrix.flavor.channel }}"
+          if [[ "$ch" == "both" || "$ch" == "$flavor_ch" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true"  >> $GITHUB_OUTPUT
+            echo "::notice::Skip ${{ matrix.flavor.name }} (channel=$ch)"
+          fi
 
-      -
-        name: Release version
+      - name: Checkout
+        if: steps.filter.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Release version
+        if: steps.filter.outputs.skip == 'false'
         id: release_version
         run: |
           app_version=$(cat version.py |sed -ne "s/APP_VERSION\s=\s'v\(.*\)'/\1/gp")
-          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo "app_version=${app_version}${{ matrix.flavor.version_suffix }}" >> $GITHUB_ENV
 
       - name: Docker metadata
+        if: steps.filter.outputs.skip == 'false'
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ github.event.inputs.docker_username }}/nastools
           tags: |
             type=raw,value=${{ env.app_version }}
-            type=raw,value=latest
+            type=raw,value=${{ matrix.flavor.extra_tag }}
 
-      -
-        name: Set Up QEMU
-        uses: docker/setup-qemu-action@v2
+      - name: Set Up QEMU
+        if: steps.filter.outputs.skip == 'false'
+        uses: docker/setup-qemu-action@v3
 
-      -
-        name: Set Up Buildx
-        uses: docker/setup-buildx-action@v2
+      - name: Set Up Buildx
+        if: steps.filter.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
 
-      -
-        name: Login DockerHub
-        uses: docker/login-action@v2
+      - name: Login DockerHub
+        if: steps.filter.outputs.skip == 'false'
+        uses: docker/login-action@v3
         with:
           username: ${{ github.event.inputs.docker_username }}
           password: ${{ github.event.inputs.docker_password }}
 
-      - 
-        name: Build Image
-        uses: docker/build-push-action@v4
+      - name: Build Image
+        if: steps.filter.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
         with:
           context: docker
-          file: docker/Dockerfile
-          platforms: |
-            linux/amd64
-            linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-  debian:
-    runs-on: ubuntu-latest
-    name: Build Docker Image (Debian)
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v3
-
-      -
-        name: Release version
-        id: release_version
-        run: |
-          app_version=$(cat version.py |sed -ne "s/APP_VERSION\s=\s'v\(.*\)'/\1/gp")
-          echo "app_version=${app_version}-debian" >> $GITHUB_ENV
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: |
-            ${{ github.event.inputs.docker_username }}/nastools
-          tags: |
-            type=raw,value=${{ env.app_version }}
-            type=raw,value=debian
-
-      -
-        name: Set Up QEMU
-        uses: docker/setup-qemu-action@v2
-
-      -
-        name: Set Up Buildx
-        uses: docker/setup-buildx-action@v2
-
-      -
-        name: Login DockerHub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ github.event.inputs.docker_username }}
-          password: ${{ github.event.inputs.docker_password }}
-
-      - 
-        name: Build Image
-        uses: docker/build-push-action@v4
-        with:
-          context: docker
-          file: docker/debian.Dockerfile
+          file: ${{ matrix.flavor.dockerfile }}
           platforms: |
             linux/amd64
             linux/arm64

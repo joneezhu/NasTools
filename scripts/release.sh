@@ -5,15 +5,21 @@
 # 功能:
 #   1) 自动汇总上一个 tag 至 HEAD 的 commit, 清洗去重后生成 CHANGELOG 条目
 #   2) 自动修改 version.py, 提交 commit 并打带变更摘要的 annotated tag
-#   3) 推送 master 与 tag, 并通过 gh CLI 触发 Docker / Beta / Package 三条流水线
+#   3) 推送 master 与 tag, 并通过 gh CLI 触发 Docker (build.yml) 与 Package (build-package.yml) 流水线
 #
 # 用法:
-#   scripts/release.sh <new_version>            # 例: scripts/release.sh v3.4.2
+#   scripts/release.sh <new_version>            # 例: scripts/release.sh v3.4.2 (默认不触发构建)
+#   scripts/release.sh <new_version> --build    # 推送后立即触发 docker / package 流水线
 #   scripts/release.sh <new_version> --dry-run  # 只演练不写入
-#   scripts/release.sh <new_version> --no-build # 不触发构建
 #   scripts/release.sh <new_version> --no-push  # 不 push 远端 (调试用)
 #   scripts/release.sh <new_version> --no-emoji # tag message 不使用 emoji 图标
 #   scripts/release.sh <new_version> --tag-limit=20  # tag message 条目上限 (默认 12)
+#
+# 默认行为:
+#   * 默认 *不* 触发 GitHub Actions, 仅生成 changelog / commit / tag / push。
+#     CI 触发改为按需手动触发, 避免误触发或在 tag 失败时产生僵尸 run。
+#   * 触发构建请加 --build, 此时会通过 gh workflow run 派发 build.yml 与 build-package.yml,
+#     且 ref 一律使用新 tag (而不是 master 分支), 这样 build-package.yml 出的 Release 会绑定到 tag。
 #
 # 凭据来源 (触发构建时需要):
 #   项目根目录 .release 文件 (KEY=VALUE 格式, 已 gitignore), 至少包含:
@@ -37,7 +43,7 @@ die()  { err "$*"; exit 1; }
 # ---------- 参数 ----------
 NEW_VERSION="${1:-}"
 DRY_RUN=false
-NO_BUILD=false
+RUN_BUILD=false        # 默认不触发 CI; 加 --build 才会跑
 NO_PUSH=false
 NO_EMOJI=false
 TAG_LIMIT=12
@@ -45,7 +51,8 @@ shift || true
 for arg in "$@"; do
   case "$arg" in
     --dry-run)  DRY_RUN=true ;;
-    --no-build) NO_BUILD=true ;;
+    --build)    RUN_BUILD=true ;;
+    --no-build) RUN_BUILD=false ;;   # 兼容旧用法 (其实是默认值)
     --no-push)  NO_PUSH=true ;;
     --no-emoji) NO_EMOJI=true ;;
     --tag-limit=*) TAG_LIMIT="${arg#*=}" ;;
@@ -53,7 +60,7 @@ for arg in "$@"; do
   esac
 done
 
-[[ -z "$NEW_VERSION" ]] && die "用法: $0 <new_version> [--dry-run] [--no-build] [--no-push]"
+[[ -z "$NEW_VERSION" ]] && die "用法: $0 <new_version> [--build] [--dry-run] [--no-push]"
 [[ "$NEW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] \
   || die "版本号格式应为 vX.Y.Z 或 vX.Y.Z-suffix, 实际: $NEW_VERSION"
 
@@ -61,7 +68,8 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 VERSION_FILE="$REPO_ROOT/version.py"
-CHANGELOG="$REPO_ROOT/docs/CHANGELOG.md"
+# 自 v3.4.x 起放弃 docs/CHANGELOG.md 单文件总账, 改为只维护单 tag 文件 docs/changelog/<tag>.md。
+# CHANGELOG.md 保留为静态导览 (说明 + 索引), 不再被 release.sh 写入。
 CHANGELOG_DIR="$REPO_ROOT/docs/changelog"
 RELEASE_ENV_FILE="$REPO_ROOT/.release"
 
@@ -100,7 +108,7 @@ fi
 # ---------- 前置校验 ----------
 log "校验工作区..."
 [[ -f "$VERSION_FILE"  ]] || die "未找到 $VERSION_FILE"
-[[ -f "$CHANGELOG"     ]] || die "未找到 $CHANGELOG"
+[[ -d "$CHANGELOG_DIR"  ]] || mkdir -p "$CHANGELOG_DIR"
 
 if ! $DRY_RUN; then
   if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -130,6 +138,14 @@ fi
 CUR_VERSION="$(grep -E "^APP_VERSION" "$VERSION_FILE" | sed -E "s/.*'(v[^']+)'.*/\1/")"
 log "当前版本: $CUR_VERSION  ->  目标版本: $NEW_VERSION"
 log "Changelog 范围: $RANGE_LABEL  ->  HEAD"
+
+# 解析远端仓库 owner/repo, 用于生成 commit / issue 超链接
+REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
+OWNER_REPO="$(echo "$REMOTE_URL" | sed -E 's#.*github.com[:/](.*)\.git$#\1#')"
+if [[ -z "$OWNER_REPO" || "$OWNER_REPO" == "$REMOTE_URL" ]]; then
+  warn "无法从 origin 解析 GitHub owner/repo, changelog 将不带超链接"
+  OWNER_REPO=""
+fi
 
 # ---------- 已有 tag / Release 状态判定 ----------
 # 三种情况:
@@ -198,8 +214,9 @@ if $ONLY_REBUILD_PACKAGE; then
     log "(本应触发) gh workflow run build-package.yml --ref $NEW_VERSION"
     exit 0
   fi
-  if $NO_BUILD; then
-    warn "--no-build, 跳过 build-package.yml 触发"
+  if ! $RUN_BUILD; then
+    warn "默认未触发 CI (加 --build 才会派发 build-package.yml)"
+    echo "    需要触发请运行: scripts/release.sh $NEW_VERSION --build"
     exit 0
   fi
   : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN}"
@@ -271,11 +288,30 @@ def normalize(subject):
         s = s[0].upper() + s[1:]
     return s
 
+OWNER_REPO = os.environ.get("OWNER_REPO", "").strip()
+
+def commit_link(short, full):
+    """commit 短哈希 -> markdown 链接 (无 OWNER_REPO 时退化为纯短哈希)"""
+    if not OWNER_REPO:
+        return short
+    return f"[`{short}`](https://github.com/{OWNER_REPO}/commit/{full})"
+
+def linkify_issues(text):
+    """正文里 #123 / GH-123 -> markdown 链接 (无 OWNER_REPO 时不动)"""
+    if not OWNER_REPO:
+        return text
+    def repl(m):
+        num = m.group(1)
+        return f"[#{num}](https://github.com/{OWNER_REPO}/issues/{num})"
+    # 仅匹配独立 token 的 #123 (前面非字母数字), 避免 markdown 标题/代码里的误伤
+    return re.sub(r"(?:(?<=^)|(?<=[\s(\[,;:]))(?:#|GH-)(\d+)\b", repl, text)
+
 buckets = collections.OrderedDict(
     (k, []) for k in ["Breaking", "Added", "Changed", "Fixed", "Removed", "Deprecated", "Security"]
 )
 seen_norm = set()
 all_short_hashes = []
+all_full_hashes = {}   # short -> full
 
 for line in raw.splitlines():
     parts = line.split("\t")
@@ -284,6 +320,7 @@ for line in raw.splitlines():
     h, subject = parts[0], parts[1].strip()
     short = h[:7]
     all_short_hashes.append(short)
+    all_full_hashes[short] = h
     if NOISE_RE.search(subject):
         continue
     norm = normalize(subject)
@@ -294,46 +331,36 @@ for line in raw.splitlines():
         continue
     seen_norm.add(key)
     cat = classify(subject)
-    buckets[cat].append((norm, short))
+    buckets[cat].append((norm, short, h))
 
-# 输出三段:
-# 1) MARK_CHANGELOG  : 写到 docs/CHANGELOG.md 的整段
-# 2) MARK_TAG        : 写到 git tag annotated message 的精简版 (只保留有内容的类目, 上限 12 条)
-# 3) MARK_HIGHLIGHTS : 5 条以内核心修改点 (Breaking > Added > Fixed > Changed)
+# 输出两段:
+# 1) MARK_CHANGELOG_FILE : 写到 docs/changelog/<tag>.md 的整段 (供 GitHub Release body)
+# 2) MARK_TAG            : 写到 git tag annotated message 的精简版 (只保留有内容的类目, 上限 12 条)
+# 3) MARK_HIGHLIGHTS     : 5 条以内核心修改点 (Breaking > Added > Fixed > Changed)
+#
+# 注: 自 v3.4.x 起放弃 docs/CHANGELOG.md 总账, 不再生成 MARK_CHANGELOG 块。
 
 new_version = os.environ["NEW_VERSION"]
 import datetime
 today = datetime.date.today().isoformat()
 
-cl_lines = [f"## [{new_version}] - {today}", ""]
-cl_lines.append(f"> 自动生成自 {os.environ.get('RANGE_LABEL', 'previous')} 至本次发布的 commit。")
-cl_lines.append("")
-any_content = False
-for cat, items in buckets.items():
-    if not items:
-        continue
-    any_content = True
-    cl_lines.append(f"### {cat}")
-    for norm, short in items:
-        cl_lines.append(f"- {norm} ({short})")
-    cl_lines.append("")
-if not any_content:
-    cl_lines.append("### Changed")
-    cl_lines.append("- 内部维护性变更, 详见 git log")
-    cl_lines.append("")
-
-print("MARK_CHANGELOG")
-print("\n".join(cl_lines))
-print("MARK_END")
-
 # 单 tag 文件 (docs/changelog/<tag>.md)
-# 与 CHANGELOG.md 中的整段内容相比, 单文件多一个 H1 标题和元信息表头, 适合作为 GitHub Release 的 body
+# 这是唯一的 changelog 落地形态, 同时作为 GitHub Release body
 file_lines = [
     f"# Release {new_version}",
     "",
     f"- **Date**: {today}",
     f"- **Range**: {os.environ.get('RANGE_LABEL', 'previous')} → {new_version}",
     f"- **Commits**: {sum(len(v) for v in buckets.values())} kept / {len(all_short_hashes)} total",
+]
+# Compare 链接 (上一个 tag 不存在时省略)
+prev_label = os.environ.get("RANGE_LABEL", "")
+if OWNER_REPO and prev_label and prev_label.startswith("v"):
+    file_lines.append(
+        f"- **Compare**: [{prev_label}...{new_version}]"
+        f"(https://github.com/{OWNER_REPO}/compare/{prev_label}...{new_version})"
+    )
+file_lines += [
     "",
     "---",
     "",
@@ -345,8 +372,8 @@ for cat, items in buckets.items():
     any_in_file = True
     file_lines.append(f"## {cat}")
     file_lines.append("")
-    for norm, short in items:
-        file_lines.append(f"- {norm} ({short})")
+    for norm, short, full in items:
+        file_lines.append(f"- {linkify_issues(norm)} ({commit_link(short, full)})")
     file_lines.append("")
 if not any_in_file:
     file_lines.append("## Changed")
@@ -402,7 +429,7 @@ for cat, items in buckets.items():
     if not items:
         continue
     tag_lines.append(f"{cat_label(cat)}  ({len(items)})")
-    for norm, short in items:
+    for norm, short, full in items:
         if total_in_tag >= TAG_LIMIT:
             overflow = True
             break
@@ -415,7 +442,7 @@ for cat, items in buckets.items():
 if overflow:
     remaining = total_kept - total_in_tag
     tag_lines.append(sep_line)
-    tag_lines.append(f"… +{remaining} more entries — see docs/CHANGELOG.md")
+    tag_lines.append(f"… +{remaining} more entries — see docs/changelog/{new_version}.md")
 
 print("MARK_TAG")
 print("\n".join(tag_lines).rstrip())
@@ -425,7 +452,7 @@ print("MARK_END")
 priority = ["Breaking", "Added", "Fixed", "Changed", "Removed", "Security", "Deprecated"]
 highlights = []
 for cat in priority:
-    for norm, short in buckets.get(cat, []):
+    for norm, short, full in buckets.get(cat, []):
         if len(highlights) >= 5:
             break
         highlights.append(f"[{cat}] {norm}")
@@ -440,6 +467,7 @@ PYEOF
 if $NO_EMOJI; then USE_EMOJI_VAL=0; else USE_EMOJI_VAL=1; fi
 PARSED="$(NEW_VERSION="$NEW_VERSION" RANGE_LABEL="$RANGE_LABEL" \
   USE_EMOJI="$USE_EMOJI_VAL" TAG_LIMIT="$TAG_LIMIT" \
+  OWNER_REPO="$OWNER_REPO" \
   python3 "$TMP_PY" <<<"$RAW_LOG")"
 
 extract() {
@@ -450,17 +478,15 @@ extract() {
   ' <<<"$PARSED"
 }
 
-CL_SECTION="$(extract MARK_CHANGELOG)"
 CL_FILE_BODY="$(extract MARK_CHANGELOG_FILE)"
 TAG_MSG="$(extract MARK_TAG)"
 HIGHLIGHTS="$(extract MARK_HIGHLIGHTS)"
 
-[[ -z "$CL_SECTION"   ]] && die "Changelog 解析失败"
 [[ -z "$CL_FILE_BODY" ]] && die "单 tag changelog 文件解析失败"
 
 echo
-echo "============== 生成的 CHANGELOG 条目 =============="
-echo "$CL_SECTION"
+echo "============== 生成的 changelog (docs/changelog/${NEW_VERSION}.md) =============="
+echo "$CL_FILE_BODY"
 echo "============== 生成的 Tag message ================="
 echo "$TAG_MSG"
 echo "==================================================="
@@ -471,58 +497,8 @@ if $DRY_RUN; then
   exit 0
 fi
 
-# ---------- 写 CHANGELOG ----------
-log "更新 docs/CHANGELOG.md..."
-# 在 ## [Unreleased] 节之后插入新版本条目, 同时清空 Unreleased 内容回到模板
-python3 - "$CHANGELOG" <<PYEOF
-import io, re, sys
-path = sys.argv[1]
-with io.open(path, "r", encoding="utf-8") as f:
-    text = f.read()
-
-new_section = """$CL_SECTION
----
-
-"""
-
-# 1) 把生成内容插到 [Unreleased] 章节之后(下一个 ## 之前)
-m = re.search(r"^## \[Unreleased\][\s\S]*?(?=^## )", text, re.M)
-if not m:
-    # 若不存在 Unreleased 节则插在第一个 ## 前
-    m2 = re.search(r"^## ", text, re.M)
-    insert_at = m2.start() if m2 else len(text)
-    text = text[:insert_at] + new_section + text[insert_at:]
-else:
-    text = text[:m.end()] + new_section + text[m.end():]
-
-# 2) 重置 Unreleased 内容
-unreleased_template = """## [Unreleased]
-
-> 下一版本开发中尚未发布的变更。
-
-### Added
-- _（待补充）_
-
-### Changed
-- _（待补充）_
-
-### Fixed
-- _（待补充）_
-
----
-
-"""
-text = re.sub(r"^## \[Unreleased\][\s\S]*?(?=^## )", unreleased_template, text, count=1, flags=re.M)
-
-# 3) 同步顶部「当前最新版本」字段
-text = re.sub(r"(当前最新版本：\*\*)v[^*]+(\*\*)", r"\1$NEW_VERSION\2", text)
-
-with io.open(path, "w", encoding="utf-8") as f:
-    f.write(text)
-print("CHANGELOG 已更新")
-PYEOF
-
 # ---------- 写 docs/changelog/<tag>.md (单 tag 单文件, 给 GitHub Release 用) ----------
+# 这是 changelog 的唯一落地点。docs/CHANGELOG.md 仅作静态导览, 不再被脚本写入。
 TAG_CHANGELOG_FILE="$CHANGELOG_DIR/${NEW_VERSION}.md"
 log "写入单 tag changelog: docs/changelog/${NEW_VERSION}.md"
 printf '%s\n' "$CL_FILE_BODY" > "$TAG_CHANGELOG_FILE"
@@ -542,7 +518,7 @@ PYEOF
 
 # ---------- commit & tag ----------
 log "提交版本 commit..."
-git add "$VERSION_FILE" "$CHANGELOG" "$TAG_CHANGELOG_FILE"
+git add "$VERSION_FILE" "$TAG_CHANGELOG_FILE"
 git commit -m "release: bump version to $NEW_VERSION
 
 $HIGHLIGHTS"
@@ -565,8 +541,17 @@ else
 fi
 
 # ---------- 触发构建 ----------
-if $NO_BUILD; then
-  warn "--no-build, 跳过构建触发"
+if ! $RUN_BUILD; then
+  warn "默认未触发 CI (本地已生成 commit/tag/changelog 并完成 push)"
+  echo
+  echo "    需要触发构建请运行 (会基于 tag $NEW_VERSION 派发 workflow):"
+  echo "      scripts/release.sh $NEW_VERSION --build"
+  echo "    或者直接手动:"
+  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=... -f channel=stable"
+  echo "      gh workflow run build-package.yml --ref $NEW_VERSION -f github_token=..."
+  echo "    (beta 通道: -f channel=beta; 同时跑稳定+beta: -f channel=both)"
+  echo
+  ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
   exit 0
 fi
 if $NO_PUSH; then
@@ -575,27 +560,32 @@ if $NO_PUSH; then
 fi
 
 if ! command -v gh >/dev/null 2>&1; then
-  warn "未安装 gh CLI, 请到 GitHub Actions 页面手动触发以下三条流水线:"
-  echo "    - .github/workflows/build.yml"
-  echo "    - .github/workflows/build-beta.yml"
+  warn "未安装 gh CLI, 请到 GitHub Actions 页面手动触发以下两条流水线 (ref 选 tag $NEW_VERSION):"
+  echo "    - .github/workflows/build.yml         (channel=stable / beta / both)"
   echo "    - .github/workflows/build-package.yml"
   exit 0
 fi
 
-: "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (或加 --no-build)}"
-: "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (或加 --no-build)}"
-: "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN (或加 --no-build)}"
+: "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (或去掉 --build)}"
+: "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (或去掉 --build)}"
+: "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN (或去掉 --build)}"
 
-log "通过 gh 触发 build.yml (Docker Hub 主线)..."
-gh workflow run build.yml --ref "$CUR_BRANCH" \
+# ref 一律用新 tag, 而非 master 分支:
+# 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
+# 2) 用分支名时, 如果之后该分支又有新 commit, ref 会漂移; 用 tag 永远精确指向本次发布
+log "通过 gh 触发 build.yml (Docker Hub 主线 stable 通道, ref=$NEW_VERSION)..."
+# 默认只跑 stable 通道 (Alpine + Debian); 如需 beta 单独手动派发:
+#   gh workflow run build.yml --ref <tag> -f channel=beta -f docker_username=... -f docker_password=...
+gh workflow run build.yml --ref "$NEW_VERSION" \
   -f docker_username="$DOCKER_USERNAME" \
-  -f docker_password="$DOCKER_PASSWORD"
+  -f docker_password="$DOCKER_PASSWORD" \
+  -f channel=stable
 
-log "通过 gh 触发 build-package.yml (二进制 + Release)..."
-gh workflow run build-package.yml --ref "$CUR_BRANCH" \
+log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
+gh workflow run build-package.yml --ref "$NEW_VERSION" \
   -f github_token="$RELEASE_GH_TOKEN"
 
-ok "构建已派发, 在 GitHub Actions 页面查看进度"
+ok "构建已派发 (ref=$NEW_VERSION), 在 GitHub Actions 页面查看进度"
 echo
 echo "    Docker Hub : https://hub.docker.com/r/${DOCKER_USERNAME}/nastools/tags"
 echo "    Releases   : https://github.com/$(git config --get remote.origin.url \
