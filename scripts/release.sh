@@ -62,7 +62,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 VERSION_FILE="$REPO_ROOT/version.py"
 CHANGELOG="$REPO_ROOT/docs/CHANGELOG.md"
+CHANGELOG_DIR="$REPO_ROOT/docs/changelog"
 RELEASE_ENV_FILE="$REPO_ROOT/.release"
+
+mkdir -p "$CHANGELOG_DIR"
 
 # ---------- 加载 .release 凭据 ----------
 # .release 是 KEY=VALUE 形式的环境文件 (已加入 .gitignore, 不会上传)
@@ -323,6 +326,38 @@ print("MARK_CHANGELOG")
 print("\n".join(cl_lines))
 print("MARK_END")
 
+# 单 tag 文件 (docs/changelog/<tag>.md)
+# 与 CHANGELOG.md 中的整段内容相比, 单文件多一个 H1 标题和元信息表头, 适合作为 GitHub Release 的 body
+file_lines = [
+    f"# Release {new_version}",
+    "",
+    f"- **Date**: {today}",
+    f"- **Range**: {os.environ.get('RANGE_LABEL', 'previous')} → {new_version}",
+    f"- **Commits**: {sum(len(v) for v in buckets.values())} kept / {len(all_short_hashes)} total",
+    "",
+    "---",
+    "",
+]
+any_in_file = False
+for cat, items in buckets.items():
+    if not items:
+        continue
+    any_in_file = True
+    file_lines.append(f"## {cat}")
+    file_lines.append("")
+    for norm, short in items:
+        file_lines.append(f"- {norm} ({short})")
+    file_lines.append("")
+if not any_in_file:
+    file_lines.append("## Changed")
+    file_lines.append("")
+    file_lines.append("- 内部维护性变更, 详见 git log")
+    file_lines.append("")
+
+print("MARK_CHANGELOG_FILE")
+print("\n".join(file_lines).rstrip())
+print("MARK_END")
+
 # tag message
 # 风格: 顶部为标题区(版本/范围/统计), 中间是类目分组, 底部是溢出提示
 USE_EMOJI = os.environ.get("USE_EMOJI", "1") == "1"
@@ -416,10 +451,12 @@ extract() {
 }
 
 CL_SECTION="$(extract MARK_CHANGELOG)"
+CL_FILE_BODY="$(extract MARK_CHANGELOG_FILE)"
 TAG_MSG="$(extract MARK_TAG)"
 HIGHLIGHTS="$(extract MARK_HIGHLIGHTS)"
 
-[[ -z "$CL_SECTION" ]] && die "Changelog 解析失败"
+[[ -z "$CL_SECTION"   ]] && die "Changelog 解析失败"
+[[ -z "$CL_FILE_BODY" ]] && die "单 tag changelog 文件解析失败"
 
 echo
 echo "============== 生成的 CHANGELOG 条目 =============="
@@ -485,6 +522,11 @@ with io.open(path, "w", encoding="utf-8") as f:
 print("CHANGELOG 已更新")
 PYEOF
 
+# ---------- 写 docs/changelog/<tag>.md (单 tag 单文件, 给 GitHub Release 用) ----------
+TAG_CHANGELOG_FILE="$CHANGELOG_DIR/${NEW_VERSION}.md"
+log "写入单 tag changelog: docs/changelog/${NEW_VERSION}.md"
+printf '%s\n' "$CL_FILE_BODY" > "$TAG_CHANGELOG_FILE"
+
 # ---------- 写 version.py ----------
 log "更新 version.py..."
 python3 - "$VERSION_FILE" "$NEW_VERSION" <<'PYEOF'
@@ -500,7 +542,7 @@ PYEOF
 
 # ---------- commit & tag ----------
 log "提交版本 commit..."
-git add "$VERSION_FILE" "$CHANGELOG"
+git add "$VERSION_FILE" "$CHANGELOG" "$TAG_CHANGELOG_FILE"
 git commit -m "release: bump version to $NEW_VERSION
 
 $HIGHLIGHTS"

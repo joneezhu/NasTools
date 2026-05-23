@@ -297,6 +297,96 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 >
 > 场景 B/C 都需要本地 **gh CLI 已登录**（脚本会用 `gh release view` 判定 assets 数）。未登录时脚本会拒绝执行，避免误把"无权限"判定成"无安装包"导致重复发版。
 
+#### 4.2.4 单 tag changelog 文件（`docs/changelog/<tag>.md`）
+
+每次 `release.sh` 在更新 `docs/CHANGELOG.md` 总账之外，会同时把当前版本的变更**单独**写入：
+
+```
+docs/changelog/<tag>.md      # 例如 docs/changelog/v3.4.3.md
+```
+
+文件结构：
+
+```markdown
+# Release v3.4.3
+
+- **Date**: 2026-05-23
+- **Range**: v3.4.2 → v3.4.3
+- **Commits**: 5 kept / 7 total
+
+---
+
+## Added
+- 新增 X 功能 (abc1234)
+...
+```
+
+它存在的目的：
+
+1. **GitHub Release body 来源**：`scripts/release-github.sh` 直接把它作为 `--notes-file` 传给 `gh release create/edit`，比 `build-package.yml` 里默认用 commit message 当 body 的方式可读得多。
+2. **可单独引用**：可在 issue / PR / 通告里链接到 `https://github.com/<owner>/<repo>/blob/master/docs/changelog/v3.4.3.md`，无需翻 CHANGELOG.md 大文件。
+3. **CI 友好**：未来若要把 release notes 推送到外部渠道（论坛 / Telegram / 邮件订阅），脚本可直接读这个文件。
+
+文件由 `release.sh` 自动生成并随 `release: bump version to vX.Y.Z` 一起 commit & tag。**不要手动修改已发布版本的文件**；如要修订内容，应通过下面的 `release-github.sh` 重新刷 GitHub Release body 即可（仓库内的历史保留原版）。
+
+#### 4.2.5 创建 / 更新 GitHub Release（`scripts/release-github.sh`）
+
+`build-package.yml` 流水线在打包成功后会自动创建 Release，但 body 用的是 commit message，不够正式。`scripts/release-github.sh` 用于：
+
+- **首次创建**：CI 因故没建出 Release 时，本地直接 `create`
+- **替换 body**：把 Release 描述刷成 `docs/changelog/<tag>.md` 的标准格式
+- **追加 assets**：上传额外文件（SHA256 校验、补丁包等），不冲掉原有 assets
+- **预发布标记**：tag 含 `-beta.1` / `-rc.1` 等后缀时自动判定为 prerelease
+
+##### 用法
+
+```bash
+# 1) 最常见：基于 docs/changelog/v3.4.3.md 创建/更新 Release
+scripts/release-github.sh v3.4.3
+
+# 2) 预演不执行
+scripts/release-github.sh v3.4.3 --dry-run
+
+# 3) 创建为 draft (人工 review 后再发布)
+scripts/release-github.sh v3.4.3 --draft
+
+# 4) 标记为预发布 (tag 带后缀时自动开启)
+scripts/release-github.sh v3.5.0-beta.1 --prerelease
+
+# 5) 上传额外 asset (SHA256 / 补丁等), 用 , 分隔
+scripts/release-github.sh v3.4.3 --assets=releases/SHA256SUMS.txt,releases/notes.pdf
+
+# 6) 强制重建 Release (会丢失原有 assets, 谨慎使用)
+scripts/release-github.sh v3.4.3 --force-recreate
+```
+
+##### 行为说明
+
+| 远端 Release 状态 | 默认行为 | 说明 |
+|------------------|---------|------|
+| 不存在 | `gh release create` | 用单 tag changelog 作 body |
+| 已存在 | `gh release edit` | **仅更新 title / body**，保留所有 assets |
+| 已存在 + `--force-recreate` | `delete` 然后 `create` | 会丢失现有 assets，仅在确实需要重建时使用 |
+
+##### 前置条件
+
+- 远端 origin 存在 tag `<tag>`（脚本会校验）
+- `docs/changelog/<tag>.md` 已存在（不存在时报错并提示先跑 `release.sh`）
+- 本地装了 `gh` 且已 `gh auth login`，或 `.release` 配置了 `RELEASE_GH_TOKEN`
+
+##### 与 `release.sh` 的协作
+
+```
+release.sh vX.Y.Z              # 生成 changelog / 打 tag / 触发 CI
+        │
+        ├── CI 跑完: build-package.yml 自动创建 Release + 上传 assets
+        │
+        └── 想美化 body 时:
+            release-github.sh vX.Y.Z   # 把 body 替换成 docs/changelog/vX.Y.Z.md
+```
+
+如果 CI 还没跑完就先想建 Release（例如只做 source release），直接 `release-github.sh vX.Y.Z` 也可以——它会以 `create` 模式跑，等 CI 跑到上传 asset 那一步就会把附件加到这个已存在的 Release 上。
+
 ### 4.3 详细步骤（手动备选流程）
 
 #### Step 1 - 代码冻结
