@@ -99,7 +99,80 @@ nastool_<platform>_v<version>[.exe]
                           └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-### 4.2 详细步骤
+### 4.2 一键发布脚本（推荐）
+
+绝大多数发布无需手动执行下述七个步骤，使用 `scripts/release.sh` 即可一站式完成 **CHANGELOG 生成 + 版本号修改 + 打 Tag + 推送 + 触发构建**。
+
+#### 首次使用：配置凭据
+
+```bash
+cp .release.example .release
+# 编辑 .release, 填入 DOCKER_USERNAME / DOCKER_PASSWORD / RELEASE_GH_TOKEN
+```
+
+`.release` 已加入 `.gitignore`，**不会被提交**。脚本启动时会自动加载，shell 中同名环境变量优先级更高（用于 CI 注入）。
+
+#### 常用命令
+
+```bash
+# 演练（推荐先跑一次确认 CHANGELOG 内容）
+scripts/release.sh v3.4.2 --dry-run
+
+# 正式发布（自动加载 .release, push + 触发流水线）
+scripts/release.sh v3.4.2
+
+# 仅本地操作（不 push、不触发 CI，调试用）
+scripts/release.sh v3.4.2 --no-push
+
+# 只想打 tag 不触发 CI（无需 .release）
+scripts/release.sh v3.4.2 --no-build
+
+# Tag message 不使用 emoji（兼容老旧 git 客户端）
+scripts/release.sh v3.4.2 --no-emoji
+
+# 调整 tag message 中变更条目上限（默认 12）
+scripts/release.sh v3.4.2 --tag-limit=20
+```
+
+#### Tag message 格式
+
+打出来的 annotated tag 内嵌结构化的变更摘要，例如：
+
+```
+Release v3.4.2
+────────────────────────────────────────────────
+Range  : v3.4.1 → v3.4.2
+Date   : 2026-05-23
+Commits: 18 kept / 22 total  ·  Categories: 3
+────────────────────────────────────────────────
+
+✨ Added  (5)
+  • 支持站点签到自定义 URL 参数  (a1b2c3d)
+  • ...
+
+🐛 Fixed  (8)
+  • 修复 brushtask 在断网时崩溃  (e4f5g6h)
+  • ...
+
+♻️ Changed  (5)
+  • 提升 _autosignin 公共方法到基类  (i7j8k9l)
+  • ...
+```
+
+可以在 GitHub Release 页、`git show v3.4.2`、`git tag -n99` 中直接查看，无需再翻 CHANGELOG。
+
+脚本会：
+
+1. 收集 **上一个 tag → HEAD** 的 commit，过滤噪声（merge / wip / typo / chore: lint 等），按前缀分类为 Added / Changed / Fixed / Removed / Breaking / Security / Deprecated
+2. 同标题去重，自动剥离 `feat:` / `fix(scope):` 等约定式前缀
+3. 在 `docs/CHANGELOG.md` 的 `[Unreleased]` 之后插入新版本节，并把 `[Unreleased]` 重置为模板
+4. 修改 `version.py` 中的 `APP_VERSION`
+5. 创建 `release: bump version to vX.Y.Z` commit，附带 5 条核心修改点
+6. 打 annotated tag，tag message 内嵌结构化变更摘要（标题区 + 类目分组 + emoji 图标，默认上限 12 条，可用 `--tag-limit=N` 调整）
+7. push master + tag 到远端
+8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub）与 `build-package.yml`（二进制 + Release）
+
+### 4.3 详细步骤（手动备选流程）
 
 #### Step 1 - 代码冻结
 

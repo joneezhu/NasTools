@@ -1,0 +1,15 @@
+# NAStool 发布凭据模板
+# 用法:
+#   1. cp .release.example .release
+#   2. 填入下面的真实值
+#   3. .release 已加入 .gitignore, 不会被提交
+#
+# 这些值仅给 scripts/release.sh 在触发 GitHub Actions workflow_dispatch 时使用。
+
+# Docker Hub 凭据 (build.yml / build-beta.yml 入参)
+DOCKER_USERNAME=
+DOCKER_PASSWORD=
+
+# Release 用 GitHub Personal Access Token (build-package.yml 入参)
+# 权限要求: repo (创建 release + 上传 assets)
+RELEASE_GH_TOKEN=
