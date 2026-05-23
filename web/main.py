@@ -1881,6 +1881,40 @@ def stream_progress():
     )
 
 
+@App.route('/stream-update')
+@login_required
+def stream_update():
+    """
+    手动更新进度 EventSource。
+    每 800ms 推一次 update_progress 快照，遇到 done=True 多发 3 帧后退出
+    （考虑客户端可能丢包；之后即使服务被 restart 也无所谓）
+    """
+
+    def __update_stream():
+        WA = WebAction()
+        last_payload = None
+        finished_extra = 0
+        while True:
+            try:
+                detail = WA.get_update_progress() or {}
+            except Exception as e:
+                detail = {"code": 1, "msg": str(e)}
+            payload = json.dumps(detail, ensure_ascii=False)
+            # 只在状态变化时推送，避免每秒固定刷屏
+            if payload != last_payload:
+                last_payload = payload
+                yield 'data: %s\n\n' % payload
+            # done 后再多推几帧保证客户端收到
+            data = (detail.get("data") or {}) if isinstance(detail, dict) else {}
+            if data.get("done"):
+                finished_extra += 1
+                if finished_extra >= 3:
+                    break
+            time.sleep(0.8)
+
+    return Response(__update_stream(), mimetype='text/event-stream')
+
+
 @Sock.route('/message')
 @login_required
 def message_handler(ws):

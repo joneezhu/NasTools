@@ -9,6 +9,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from math import floor
 from pathlib import Path
@@ -81,6 +82,7 @@ class WebAction:
             "get_site_favicon": self.__get_site_favicon,
             "restart": self.__restart,
             "update_system": self.update_system,
+            "update_progress": self.get_update_progress,
             "reset_db_version": self.__reset_db_version,
             "logout": self.__logout,
             "update_config": self.__update_config,
@@ -1216,15 +1218,160 @@ class WebAction:
         self.restart_server()
         return {"code": 0}
 
-    def update_system(self):
+    # ==================== 异步更新进度状态机 ====================
+    # 把 update_system 改成 fire-and-forget：
+    # - 主线程立即返回 {code: 0, async: True}，前端通过 SSE /stream-update 看进度
+    # - 后台线程执行原有同步逻辑（git fetch/reset/restart），过程中：
+    #   * 写 _UPDATE_PROGRESS 状态字典（phase / percent / message / done）
+    #   * 把每条命令的 stdout/stderr 行追加到 _UPDATE_LOG_BUFFER 末尾（最多保留 500 行）
+    # - get_update_progress 返回当前快照，stream-update SSE 路由轮询它
+    #
+    # 设计要点:
+    # 1) 单例锁 _UPDATE_LOCK 保护并发触发，第二次点击直接返回 already_running
+    # 2) progress 字典在内存里（足够，因为 update 成功就 restart 了；失败也只是这次会话的进度）
+    # 3) phase 流转: idle → preflight → fetching → resetting → installing → restarting → done(success/fail)
+    # 4) 前端关掉网页/刷新时不影响后台线程，下次再连 SSE 仍能看到当前快照
+    _UPDATE_PROGRESS = {
+        "phase": "idle",
+        "percent": 0,
+        "message": "",
+        "done": False,
+        "success": False,
+        "channel": "",
+        "target_ref": "",
+        "started_at": 0,
+        "finished_at": 0,
+    }
+    _UPDATE_LOG_BUFFER = []  # list[str]，最近 500 行
+    _UPDATE_LOG_MAX = 500
+    _UPDATE_LOCK = threading.Lock()
+    _UPDATE_THREAD = None
+
+    @classmethod
+    def _update_log(cls, line):
+        """追加一行到环形日志缓冲。多行字符串自动拆分。"""
+        if not line:
+            return
+        for raw in str(line).splitlines():
+            raw = raw.rstrip()
+            if not raw:
+                continue
+            ts = time.strftime("%H:%M:%S")
+            cls._UPDATE_LOG_BUFFER.append(f"[{ts}] {raw}")
+            if len(cls._UPDATE_LOG_BUFFER) > cls._UPDATE_LOG_MAX:
+                # 超过上限就砍掉前 50 条，避免每条都触发 list slice
+                del cls._UPDATE_LOG_BUFFER[: len(cls._UPDATE_LOG_BUFFER) - cls._UPDATE_LOG_MAX + 50]
+
+    @classmethod
+    def _update_set(cls, **kwargs):
+        """更新进度字典。"""
+        cls._UPDATE_PROGRESS.update(kwargs)
+
+    @staticmethod
+    def _resolve_update_ref(channel):
         """
-        手动更新主程序代码
-        - 区分 群晖套件 / Docker 容器 / 其他（裸机 or 开发机）三种环境
-        - 每一步命令都打日志（命令、退出码、stdout/stderr 摘要）
-        - 任意一步失败立刻短路，**不重启**，返回 {code: 1, msg: ...} 让前端感知
-        - 前端日志也能在 系统设置→实时日志 里看到，搜关键字 [Update]
+        把通道名映射为 git ref。
+        - master: 直接返回 'master'
+        - stable: GitHub 取最新 non-prerelease tag_name；失败回落 master
+        - beta:   取最新 release（含 prerelease）tag_name；失败回落 master
+        返回 (ref, ref_type)，ref_type ∈ {"branch","tag"}，方便上层日志展示。
         """
-        log.info("【Update】===== 收到手动更新请求 =====")
+        if channel not in ("stable", "beta"):
+            return "master", "branch"
+        try:
+            req = RequestUtils(proxies=Config().get_proxies())
+            res = req.get_res(
+                "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=15"
+            )
+            if not res or res.status_code != 200:
+                log.warn(f"【Update】解析通道 {channel} 失败：GitHub releases 拉取失败，回落 master")
+                return "master", "branch"
+            releases = res.json() or []
+            for r in releases:
+                if r.get("draft"):
+                    continue
+                if r.get("prerelease") and channel == "stable":
+                    continue
+                tag = r.get("tag_name")
+                if tag:
+                    return tag, "tag"
+            log.warn(f"【Update】通道 {channel} 没有可用 release，回落 master")
+            return "master", "branch"
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return "master", "branch"
+
+    def get_update_progress(self, _data=None):
+        """
+        前端 SSE / 轮询接口。返回当前进度 + 最近 N 行日志。
+        """
+        snapshot = dict(self._UPDATE_PROGRESS)
+        # 只取最后 80 行避免每次 push 巨量日志
+        snapshot["log_tail"] = list(self._UPDATE_LOG_BUFFER[-80:])
+        return {"code": 0, "data": snapshot}
+
+    def update_system(self, _data=None):
+        """
+        异步入口：立即返回，后台线程执行 _run_update_pipeline。
+        """
+        with WebAction._UPDATE_LOCK:
+            if WebAction._UPDATE_THREAD and WebAction._UPDATE_THREAD.is_alive():
+                # 已经有线程在跑：拒绝重复触发，前端可以直接连 SSE 看现状
+                log.warn("【Update】已有更新线程在执行，本次请求被忽略")
+                return {
+                    "code": 1,
+                    "msg": "已有更新进程在执行，请稍等并查看进度面板",
+                    "already_running": True,
+                }
+
+            # 重置进度状态
+            WebAction._UPDATE_LOG_BUFFER.clear()
+            WebAction._UPDATE_PROGRESS.update({
+                "phase": "preflight",
+                "percent": 1,
+                "message": "准备更新...",
+                "done": False,
+                "success": False,
+                "channel": "",
+                "target_ref": "",
+                "started_at": int(time.time()),
+                "finished_at": 0,
+            })
+            WebAction._UPDATE_THREAD = threading.Thread(
+                target=self._run_update_pipeline, daemon=True, name="nt-update"
+            )
+            WebAction._UPDATE_THREAD.start()
+        return {"code": 0, "async": True, "msg": "更新已在后台启动"}
+
+    def _run_update_pipeline(self):
+        """
+        后台线程：执行原同步更新逻辑，过程中持续写进度。
+        """
+        try:
+            self._do_update_inner()
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【Update】后台线程异常: {e}")
+            WebAction._update_log(f"!! 后台异常: {e}")
+            WebAction._update_set(
+                phase="failed",
+                percent=100,
+                message=f"更新异常: {e}",
+                done=True,
+                success=False,
+                finished_at=int(time.time()),
+            )
+
+    def _do_update_inner(self):
+        """
+        原 update_system 的主体逻辑（同步阻塞）。运行在后台线程。
+        相比原版主要改动:
+        - 所有 log.* 同步写入 _UPDATE_LOG_BUFFER
+        - 关键节点更新 _UPDATE_PROGRESS.phase/percent/message
+        - 支持 update_channel 配置（stable/beta/master）解析为目标 ref
+        """
+        log.info("【Update】===== 收到手动更新请求 (async) =====")
+        WebAction._update_log("收到手动更新请求")
 
         # ---- 1. 环境识别 ----
         if SystemUtils.is_synology():
@@ -1235,80 +1382,87 @@ class WebAction:
             env = "windows"
         else:
             env = "host"
-        branch = os.getenv("NASTOOL_VERSION", "master")
+
+        # ---- 通道解析 ----
+        # 优先 Config.app.update_channel；兼容老的 NASTOOL_VERSION 环境变量（仅当 channel 缺省时）
+        app_cfg = Config().get_config("app") or {}
+        channel = (app_cfg.get("update_channel") or "").strip().lower()
+        if channel not in ("stable", "beta", "master"):
+            # 老用户没配过：默认走 master，与原行为一致
+            channel = "master"
+        env_branch = os.getenv("NASTOOL_VERSION")
+        if env_branch and channel == "master":
+            # 显式环境变量覆盖（兼容老部署）
+            target_ref, ref_type = env_branch, "branch"
+            log.info(f"【Update】使用 NASTOOL_VERSION={env_branch} 环境变量覆盖通道")
+        else:
+            target_ref, ref_type = self._resolve_update_ref(channel)
         workdir = os.getenv("WORKDIR") or "/nas-tools"
-        log.info(f"【Update】运行环境: {env}  分支: {branch}  工作目录: {workdir}")
+
+        WebAction._update_set(channel=channel, target_ref=target_ref)
+        log.info(f"【Update】运行环境: {env}  通道: {channel}  目标 ref: {target_ref}({ref_type})  工作目录: {workdir}")
+        WebAction._update_log(f"环境: {env}  通道: {channel}  目标: {target_ref} ({ref_type})")
 
         # ---- 2. 执行 helper ----
         def _run(cmd, cwd=None, allow_fail=False, timeout=600):
             """执行 shell 命令并把结果写到日志, 返回 (returncode, stdout, stderr)。"""
             log.info(f"【Update】$ {cmd}" + (f"   (cwd={cwd})" if cwd else ""))
+            WebAction._update_log(f"$ {cmd}")
             try:
                 proc = subprocess.run(
-                    cmd,
-                    shell=True,
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
+                    cmd, shell=True, cwd=cwd,
+                    capture_output=True, text=True, timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 log.error(f"【Update】命令超时({timeout}s): {cmd}")
+                WebAction._update_log(f"!! 命令超时({timeout}s)")
                 if allow_fail:
                     return -1, "", "timeout"
                 raise
             except Exception as e:
                 log.error(f"【Update】命令执行异常: {cmd}  错误: {e}")
+                WebAction._update_log(f"!! 命令异常: {e}")
                 if allow_fail:
                     return -1, "", str(e)
                 raise
             out = (proc.stdout or "").strip()
             err = (proc.stderr or "").strip()
             if out:
-                # 截断防止日志爆炸
                 snippet = out if len(out) <= 2000 else out[:2000] + " ...(truncated)"
                 log.info(f"【Update】[stdout]\n{snippet}")
+                WebAction._update_log(out if len(out) <= 800 else out[:800] + " ...")
             if err:
                 snippet = err if len(err) <= 2000 else err[:2000] + " ...(truncated)"
                 log.warn(f"【Update】[stderr]\n{snippet}")
+                WebAction._update_log(f"[stderr] {err if len(err) <= 800 else err[:800] + ' ...'}")
             log.info(f"【Update】退出码: {proc.returncode}")
             return proc.returncode, out, err
 
         # ---- 3. 各环境执行流程 ----
         try:
             if env == "synology":
-                # 群晖：调用套件命令
+                WebAction._update_set(phase="preflight", percent=5, message="群晖：检查目标目录权限...")
                 running = SystemUtils.execute(
                     '/bin/ps -w -x | grep -v grep | grep -w "nastool update" | wc -l'
                 )
                 log.info(f"【Update】群晖检测：当前 'nastool update' 进程数 = {running}")
                 if running != "0":
                     log.warn("【Update】已有更新进程在跑，本次不重复触发")
-                    return {"code": 1, "msg": "已有更新进程在执行，请稍后再试"}
+                    WebAction._update_set(
+                        phase="failed", percent=100,
+                        message="已有更新进程在执行（系统层），请稍后再试",
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
 
-                # ===== 预校验目标目录 owner（不自愈，直接给精确指引）=====
-                # 根因：web 进程跑在套件用户（不同套件作者命名不同：NASTool / sc-nastool / nt 等），
-                # git reset --hard 一旦遇到 owner 不是自己的文件
-                # （root 手工 cp、套件 postinst chown 漏勾、submodule pack 文件、DSM 升级遗留）
-                # 立刻 Permission denied，update 半成功 → 启动报 BuiltinIndexerFileMd5 校验失败。
-                #
-                # 设计要点：
-                # 1) 不 hard-code 用户名（nt/sc-nastool/NASTool 都见过），用 `id -un/-gn` 动态探测；
-                # 2) 不再尝试 sudo -n chown 自愈——群晖套件账户默认不在 NOPASSWD sudoers 里，
-                #    99% 跑不通；不如把异常文件列表直接塞回报错，让用户一条 SSH 命令搞定。
                 target_dir = "/var/packages/NASTool/target/nas-tools"
                 _, cur_user, _ = _run("id -un", timeout=5)
                 _, cur_group, _ = _run("id -gn", timeout=5)
                 cur_user = (cur_user or "").strip() or "NASTool"
                 cur_group = (cur_group or "").strip() or cur_user
-                log.info(
-                    f"【Update】群晖：当前进程 user:group = {cur_user}:{cur_group}"
-                )
+                log.info(f"【Update】群晖：当前进程 user:group = {cur_user}:{cur_group}")
                 _, who, _ = _run(f"stat -c '%U:%G' {target_dir}", timeout=10)
-                log.info(
-                    f"【Update】群晖：目标目录 owner = {who.strip() if who else '未知'}"
-                )
-                # 列出 owner 不属于当前用户的文件（最多 5 条），非空就拒绝跑 update
+                log.info(f"【Update】群晖：目标目录 owner = {who.strip() if who else '未知'}")
                 _, bad_files, _ = _run(
                     f"find {target_dir} \\( ! -user {cur_user} -o ! -group {cur_group} \\) "
                     f"-print 2>/dev/null | head -5",
@@ -1320,39 +1474,38 @@ class WebAction:
                         f"【Update】群晖：发现 {len(bad_lines)} 个 owner 异常文件（前5条），"
                         f"git 无法删除，拒绝执行更新:\n" + "\n".join(bad_lines)
                     )
-                    return {
-                        "code": 1,
-                        "msg": (
-                            f"群晖目标目录存在 owner 不是套件用户 {cur_user} 的文件，"
-                            f"git reset 会失败。请 SSH 登录后用 root 执行：\n"
-                            f"sudo chown -R {cur_user}:{cur_group} {target_dir}\n"
-                            f"sudo chmod -R u+rwX,go+rX {target_dir}\n"
-                            f"示例异常文件：" + "; ".join(bad_lines[:3])
-                        ),
-                    }
-                # ===== 校验结束 =====
+                    msg = (
+                        f"群晖目标目录存在 owner 不是套件用户 {cur_user} 的文件，"
+                        f"git reset 会失败。请 SSH 用 root 执行：\n"
+                        f"sudo chown -R {cur_user}:{cur_group} {target_dir}\n"
+                        f"sudo chmod -R u+rwX,go+rX {target_dir}\n"
+                        f"示例异常文件：" + "; ".join(bad_lines[:3])
+                    )
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
 
-                rc, out, err = _run("nastool update", timeout=1800)
-                # 注意：群晖 `nastool update` 即使 git reset 出现 Permission denied，
-                # 也常常以 rc=0 退出 + stdout 打印 "更新失败，继续使用旧的程序来启动..."。
-                # 仅靠 rc 判断会误判成功并继续 restart_server，
-                # 重启后用旧/混合代码启动，再触发 BuiltinIndexerFileMd5 校验失败。
-                # 这里增加 stdout/stderr 关键字检测，强制识别为失败。
+                # 群晖套件命令封装了 git fetch/reset，无法在中途细分进度，只能粗粒度
+                WebAction._update_set(phase="fetching", percent=20, message=f"执行 nastool update（目标 {target_ref}）...")
+                # 群晖的 nastool update 脚本默认拉 master；通道选 stable/beta 时通过环境变量覆盖
+                update_cmd = "nastool update"
+                if ref_type == "tag":
+                    # 群晖侧通过 NASTOOL_VERSION 让套件脚本切到 tag；
+                    # 与现有套件脚本的 `git fetch / reset --hard origin/${NASTOOL_VERSION}` 兼容
+                    update_cmd = f"NASTOOL_VERSION={target_ref} nastool update"
+                elif target_ref != "master":
+                    update_cmd = f"NASTOOL_VERSION={target_ref} nastool update"
+                rc, out, err = _run(update_cmd, timeout=1800)
                 err_keywords = [
-                    "更新失败",
-                    "unable to unlink",
-                    "Permission denied",
-                    "error: unable to",
-                    "fatal:",
+                    "更新失败", "unable to unlink", "Permission denied",
+                    "error: unable to", "fatal:",
                 ]
                 combined = f"{out}\n{err}"
                 hit_keywords = [kw for kw in err_keywords if kw in combined]
                 if rc != 0 or hit_keywords:
                     if hit_keywords:
-                        log.error(
-                            f"【Update】群晖 nastool update 检测到失败关键字 {hit_keywords}（rc={rc}），"
-                            f"判定为失败，不重启服务"
-                        )
                         msg = (
                             "群晖更新失败：检测到权限不足或 git 错误"
                             f"（命中关键字：{', '.join(hit_keywords[:3])}）。"
@@ -1360,24 +1513,30 @@ class WebAction:
                             f"sudo chown -R {cur_user}:{cur_group} /var/packages/NASTool/target  后再试。"
                         )
                     else:
-                        log.error(f"【Update】群晖 nastool update 失败 rc={rc}，不重启")
                         msg = f"群晖更新命令失败 (rc={rc})，详情查看日志"
-                    return {"code": 1, "msg": msg}
+                    log.error(f"【Update】群晖 nastool update 失败：{msg}")
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
                 log.info("【Update】群晖更新成功，准备重启服务")
+                WebAction._update_set(phase="restarting", percent=85, message="代码已更新，正在重启服务...")
 
             elif env == "docker":
-                # Docker：在容器内做 git 升级。**不再使用 sudo**（容器里不一定有 sudo）。
-                # 重要：无论成功失败都不要再装 pip 依赖（重型操作交给镜像启动时的 init-010-update）。
                 if not os.path.isdir(os.path.join(workdir, ".git")):
                     msg = f"工作目录 {workdir} 不是 git 仓库，无法手动更新（请重启容器走启动升级流程）"
                     log.error(f"【Update】{msg}")
-                    return {"code": 1, "msg": msg}
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
 
-                # 清理 git 代理
+                WebAction._update_set(phase="preflight", percent=10, message="配置 git 代理...")
                 _run("git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
                 _run("git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
 
-                # 配置代理（如果有）
                 proxies = (Config().get_proxies() or {})
                 http_proxy = proxies.get("http")
                 https_proxy = proxies.get("https")
@@ -1388,33 +1547,59 @@ class WebAction:
                          cwd=workdir, allow_fail=True)
                     log.info(f"【Update】已配置 git 代理: {http_proxy or https_proxy}")
 
-                # 记录更新前 commit 方便排查
                 _run("git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
 
-                # 拉取并强制重置
-                rc, _, _ = _run(f"git fetch --depth 1 origin {branch}", cwd=workdir, timeout=600)
+                WebAction._update_set(phase="fetching", percent=25, message=f"git fetch {target_ref}...")
+                if ref_type == "tag":
+                    rc, _, _ = _run(
+                        f"git fetch --depth 1 origin tag {target_ref} --no-tags",
+                        cwd=workdir, timeout=600,
+                    )
+                else:
+                    rc, _, _ = _run(
+                        f"git fetch --depth 1 origin {target_ref}",
+                        cwd=workdir, timeout=600,
+                    )
                 if rc != 0:
-                    return {"code": 1, "msg": f"git fetch 失败 (rc={rc})，详情查看日志"}
-                rc, _, _ = _run(f"git reset --hard origin/{branch}", cwd=workdir)
+                    msg = f"git fetch 失败 (rc={rc})，详情查看日志"
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
+
+                WebAction._update_set(phase="resetting", percent=55, message=f"git reset 到 {target_ref}...")
+                if ref_type == "tag":
+                    rc, _, _ = _run(f"git reset --hard {target_ref}", cwd=workdir)
+                else:
+                    rc, _, _ = _run(f"git reset --hard origin/{target_ref}", cwd=workdir)
                 if rc != 0:
-                    return {"code": 1, "msg": f"git reset 失败 (rc={rc})，详情查看日志"}
+                    msg = f"git reset 失败 (rc={rc})，详情查看日志"
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
                 _run("git submodule update --init --recursive", cwd=workdir, allow_fail=True, timeout=600)
-
-                # 记录更新后 commit
                 _run("git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
+
                 log.info("【Update】Docker 容器内代码更新完成，准备重启服务")
-                log.warn(
-                    "【Update】注意：手动更新只 git pull 代码，**不会**重新安装 requirements 与 third_party。"
-                    " 如需完整升级请重启容器（容器启动会跑 init-010-update 完成依赖更新）。"
-                )
+                log.warn("【Update】注意：手动更新只 git pull 代码，不会重新安装 requirements 与 third_party。")
+                WebAction._update_log("注意：手动更新只 git pull 代码，重型依赖更新需重启容器")
+                WebAction._update_set(phase="restarting", percent=85, message="代码已更新，正在重启服务...")
 
             elif env == "windows":
                 msg = "Windows 环境暂不支持网页一键更新，请手动 git pull 后重启"
                 log.warn(f"【Update】{msg}")
-                return {"code": 1, "msg": msg}
+                WebAction._update_set(
+                    phase="failed", percent=100, message=msg,
+                    done=True, success=False, finished_at=int(time.time())
+                )
+                return
 
             else:
-                # 裸机：保留原有 sudo 流程，但加上日志和失败短路
+                # 裸机
+                WebAction._update_set(phase="preflight", percent=10, message="配置 git 代理...")
                 _run("sudo git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
                 _run("sudo git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
                 proxies = (Config().get_proxies() or {})
@@ -1428,37 +1613,87 @@ class WebAction:
 
                 _run("sudo git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
                 _run("sudo git clean -dffx", cwd=workdir, allow_fail=True)
-                rc, _, _ = _run(f"sudo git fetch --depth 1 origin {branch}", cwd=workdir, timeout=600)
+
+                WebAction._update_set(phase="fetching", percent=25, message=f"git fetch {target_ref}...")
+                if ref_type == "tag":
+                    rc, _, _ = _run(
+                        f"sudo git fetch --depth 1 origin tag {target_ref} --no-tags",
+                        cwd=workdir, timeout=600,
+                    )
+                else:
+                    rc, _, _ = _run(
+                        f"sudo git fetch --depth 1 origin {target_ref}",
+                        cwd=workdir, timeout=600,
+                    )
                 if rc != 0:
-                    return {"code": 1, "msg": f"git fetch 失败 (rc={rc})，详情查看日志"}
-                rc, _, _ = _run(f"sudo git reset --hard origin/{branch}", cwd=workdir)
+                    msg = f"git fetch 失败 (rc={rc})，详情查看日志"
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
+
+                WebAction._update_set(phase="resetting", percent=55, message=f"git reset 到 {target_ref}...")
+                if ref_type == "tag":
+                    rc, _, _ = _run(f"sudo git reset --hard {target_ref}", cwd=workdir)
+                else:
+                    rc, _, _ = _run(f"sudo git reset --hard origin/{target_ref}", cwd=workdir)
                 if rc != 0:
-                    return {"code": 1, "msg": f"git reset 失败 (rc={rc})，详情查看日志"}
+                    msg = f"git reset 失败 (rc={rc})，详情查看日志"
+                    WebAction._update_set(
+                        phase="failed", percent=100, message=msg,
+                        done=True, success=False, finished_at=int(time.time())
+                    )
+                    return
                 _run("sudo git submodule update --init --recursive", cwd=workdir, allow_fail=True, timeout=600)
                 _run("sudo git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
-                # 安装依赖
+
+                WebAction._update_set(phase="installing", percent=70, message="安装 pip 依赖...")
                 rc, _, _ = _run(f"sudo pip install -r {workdir}/requirements.txt",
                                 cwd=workdir, allow_fail=True, timeout=900)
                 if rc != 0:
                     log.warn(f"【Update】依赖安装返回非 0 (rc={rc})，已忽略继续重启")
-                # 修复权限
+                    WebAction._update_log(f"!! pip install 返回非 0 (rc={rc})，继续重启")
                 _run(f"sudo chown -R nt:nt {workdir}", allow_fail=True)
                 log.info("【Update】裸机环境代码与依赖更新完成，准备重启服务")
+                WebAction._update_set(phase="restarting", percent=90, message="代码与依赖已更新，正在重启服务...")
 
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             log.error(f"【Update】更新过程抛出异常: {e}")
-            return {"code": 1, "msg": f"更新异常: {e}"}
+            WebAction._update_log(f"!! 异常: {e}")
+            WebAction._update_set(
+                phase="failed", percent=100, message=f"更新异常: {e}",
+                done=True, success=False, finished_at=int(time.time())
+            )
+            return
 
         # ---- 4. 全部成功才重启 ----
         log.info("【Update】===== 更新成功，开始重启服务 =====")
+        WebAction._update_log("===== 更新成功，开始重启服务 =====")
+        WebAction._update_set(
+            phase="done", percent=100,
+            message="更新成功！服务即将重启，页面将在重启完成后回登录页",
+            done=True, success=True, finished_at=int(time.time())
+        )
+        # 给前端 SSE 一点时间收到 done 帧
+        try:
+            time.sleep(1.5)
+        except Exception:
+            pass
         try:
             self.restart_server()
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
             log.error(f"【Update】重启服务失败: {e}")
-            return {"code": 1, "msg": f"代码已更新但重启失败: {e}"}
-        return {"code": 0}
+            WebAction._update_set(
+                phase="failed", percent=100,
+                message=f"代码已更新但重启失败: {e}",
+                done=True, success=False, finished_at=int(time.time())
+            )
+            return
+
+    # ==================== 异步更新 END ====================
 
     @staticmethod
     def __reset_db_version():
