@@ -18,9 +18,10 @@ RUN set -xe \
     && curl https://dl.min.io/client/mc/release/linux-${ARCH}/mc --create-dirs -o /usr/bin/mc \
     && chmod +x /usr/bin/mc \
     # fast-bencode==1.1.3 是上古 sdist, 不兼容 setuptools 70+
-    # 必须先钉死外层 setuptools<70, 再用 --no-build-isolation 让 fast-bencode 复用外层环境
+    # supervisor 依赖 pkg_resources, setuptools 81+ 已移除, 必须钉 <70 同时满足两个约束
+    # 必须先钉死外层 setuptools<70 + pip<25, 再用 --no-build-isolation 让 fast-bencode 复用外层环境
     # (默认 pip 会给每个 sdist 单独建 overlay 装最新 setuptools, 把我们钉的版本架空)
-    && pip install --upgrade pip 'setuptools<70' wheel cython \
+    && pip install --upgrade 'pip<25' 'setuptools<70' wheel cython \
     && pip install --no-build-isolation 'fast-bencode==1.1.3' \
     && pip install -r https://raw.githubusercontent.com/joneezhu/NasTools/master/requirements.txt \
     && apk del --purge .build-deps \

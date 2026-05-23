@@ -38,6 +38,7 @@ class SearchType(Enum):
     SLACK = "Slack"
     SYNOLOGY = "Synology Chat"
     PLUGIN = "插件"
+    BRUSH = "刷流"
 
 
 class RmtMode(Enum):

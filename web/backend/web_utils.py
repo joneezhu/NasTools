@@ -2,6 +2,7 @@ from functools import lru_cache
 
 import cn2an
 
+import log
 from app.media import Media, Bangumi, DouBan
 from app.media.meta import MetaInfo
 from app.utils import StringUtils, ExceptionUtils, SystemUtils, RequestUtils, IpUtils
@@ -50,22 +51,71 @@ class WebUtils:
     def get_latest_version():
         """
         获取最新版本号
+
+        注意:
+          - GitHub API `/releases/latest` 不会返回 prerelease (beta/rc/alpha) 类型的 release,
+            即使仓库里只有 prerelease 也会返回 404. 所以这里的策略是:
+            1. 先打 `/releases?per_page=10` 拿到列表 (按发布时间排序, 包括 prerelease)
+            2. 根据配置 `app.include_prerelease` (默认 True) 决定是否纳入 prerelease
+            3. 取列表中第一个 non-draft & 满足条件的 release 作为最新版
+
+          - app.releases_update_only = True 时只返回 tag_name 不带 commit, 比对更精确;
+            False 时附加 master commit, 用于判断同主版本下是否有 commit-only 更新
         """
         try:
-            releases_update_only = Config().get_config("app").get("releases_update_only")
-            version_res = RequestUtils(proxies=Config().get_proxies()).get_res(
-                "https://api.github.com/repos/joneezhu/NasTools/releases/latest")
-            commit_res = RequestUtils(proxies=Config().get_proxies()).get_res(
-                "https://api.github.com/repos/joneezhu/NasTools/commits/master")
-            if version_res and commit_res:
-                ver_json = version_res.json()
-                commit_json = commit_res.json()
-                if releases_update_only:
-                    version = f"{ver_json['tag_name']}"
+            app_cfg = Config().get_config("app") or {}
+            releases_update_only = app_cfg.get("releases_update_only")
+            include_prerelease = app_cfg.get("include_prerelease", True)
+
+            req = RequestUtils(proxies=Config().get_proxies())
+            list_url = "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=10"
+            list_res = req.get_res(list_url)
+            if not list_res:
+                # 通常是连不上 GitHub（DNS / 代理 / 网络），请求层直接返回 None
+                log.warn(
+                    f"【Version】拉取 GitHub releases 列表无响应：{list_url}"
+                    f"（请检查网络或代理设置；不影响主程序运行）"
+                )
+                return None, None
+            if list_res.status_code != 200:
+                log.warn(
+                    f"【Version】拉取 GitHub releases 列表失败 status={list_res.status_code}"
+                    f" url={list_url}"
+                )
+                return None, None
+            releases = list_res.json() or []
+            if not isinstance(releases, list):
+                return None, None
+
+            target = None
+            for r in releases:
+                if r.get("draft"):
+                    continue
+                if r.get("prerelease") and not include_prerelease:
+                    continue
+                target = r
+                break
+
+            if not target:
+                log.info("【Version】GitHub releases 列表为空 (或全部被过滤)")
+                return None, None
+
+            tag_name = target.get("tag_name") or ""
+            url = target.get("html_url") or ""
+
+            if releases_update_only:
+                version = tag_name
+            else:
+                # 附加 master commit 短哈希用于 commit-only 更新检测
+                commit_res = req.get_res(
+                    "https://api.github.com/repos/joneezhu/NasTools/commits/master"
+                )
+                if commit_res and commit_res.status_code == 200:
+                    commit_sha = (commit_res.json() or {}).get("sha", "")
+                    version = f"{tag_name} {commit_sha[:7]}" if commit_sha else tag_name
                 else:
-                    version = f"{ver_json['tag_name']} {commit_json['sha'][:7]}"
-                url = ver_json["html_url"]
-                return version, url
+                    version = tag_name
+            return version, url
         except Exception as e:
             ExceptionUtils.exception_traceback(e)
         return None, None

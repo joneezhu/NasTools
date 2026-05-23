@@ -203,9 +203,42 @@
           </div>
           <div class="dz-message">
             <h3 class="dropzone-msg-title">上传备份文件</h3>
-            <span class="dropzone-msg-desc">点击或者拖动备份文件到此处</span>
+            <span class="dropzone-msg-desc">点击或者拖动备份文件（.zip）到此处，可以是本机生成的备份，也可以是来自其他 NasTools 分支的备份</span>
           </div>
         </form>
+
+        <div id="restore_inspect" class="alert alert-info mt-3" style="display:none;">
+          <div class="fw-bold mb-2">备份文件信息</div>
+          <div class="small" id="restore_inspect_body"></div>
+        </div>
+
+        <div class="mt-3">
+          <div class="form-label">恢复模式</div>
+          <div class="form-selectgroup form-selectgroup-pills">
+            <label class="form-selectgroup-item">
+              <input type="radio" name="restore_mode" value="replace" class="form-selectgroup-input" checked>
+              <span class="form-selectgroup-label">
+                <strong>整库覆盖</strong>
+                <div class="text-muted small">同分支同版本恢复 / 本机数据迁移。覆盖 config.yaml、default-category.yaml、user.db。</div>
+              </span>
+            </label>
+            <label class="form-selectgroup-item">
+              <input type="radio" name="restore_mode" value="merge" class="form-selectgroup-input">
+              <span class="form-selectgroup-label">
+                <strong>智能合并 <span class="badge bg-blue ms-1">跨分支推荐</span></strong>
+                <div class="text-muted small">从其他分支/版本导入。保留本机表结构与 alembic_version，仅迁移业务数据，启动时自动迁移到本机版本。</div>
+              </span>
+            </label>
+          </div>
+          <div class="form-check form-switch mt-2">
+            <input class="form-check-input" type="checkbox" id="restore_config_yaml">
+            <label class="form-check-label" for="restore_config_yaml">同时覆盖 config.yaml / default-category.yaml（合并模式默认关闭，避免覆盖本机端口/路径配置）</label>
+          </div>
+        </div>
+
+        <div class="alert alert-warning mt-3 mb-0 small">
+          ⚠️ 恢复操作会自动在 <code>config/backup_file/rollback_*</code> 备份当前文件。如恢复后异常，可手动取回。<b>建议恢复前停用所有定时任务</b>，恢复后重启容器/服务生效。
+        </div>
       </div>
       <div class="modal-footer">
         <button id="backup_btn" class="btn btn-primary">备份当前配置</button>
@@ -374,21 +407,71 @@
   // 恢复备份
   $("#restore_btn").unbind("click").click(function () {
     if (!backup_dropzone || !backup_dropzone.files || !backup_dropzone.files[0]) {
+      show_fail_modal("请先上传备份文件");
       return;
     }
-    $(this).text("恢复中...").attr("disabled", true);
-    ajax_post("restory_backup", { file_name: backup_dropzone.files[backup_dropzone.files.length - 1].name }, function (ret) {
-      $(this).attr("disabled", false).text("恢复配置");
-      $("#modal-backup").modal('hide');
-      if (ret.code === 0) {
-        show_success_modal("备份恢复成功，请重启系统生效！");
-      } else {
-        show_fail_modal(`备份恢复失败：${ret.msg}`, function() {
-          $("#modal-backup").modal('show');
-        });
-      }
+    const file_name = backup_dropzone.files[backup_dropzone.files.length - 1].name;
+    const mode = $("input[name='restore_mode']:checked").val() || "replace";
+    const restore_config = $("#restore_config_yaml").is(":checked");
+    const that = $(this);
+    const tip = mode === "merge"
+      ? "将以智能合并模式导入业务数据，保留本机表结构与 alembic 版本。\n确认继续？"
+      : "将整库覆盖本机数据库与配置文件。\n确认继续？";
+    show_confirm_modal(tip, function () {
+      hide_confirm_modal();
+      that.text("恢复中...").attr("disabled", true);
+      ajax_post("restory_backup", {
+        file_name: file_name,
+        mode: mode,
+        restore_config: restore_config
+      }, function (ret) {
+        that.attr("disabled", false).text("恢复配置");
+        $("#modal-backup").modal('hide');
+        if (ret.code === 0) {
+          let extra = "";
+          if (ret.summary) {
+            extra = `\n合并：${ret.summary.tables} 张表 / ${ret.summary.rows} 行`;
+          }
+          show_success_modal(`备份恢复成功${extra}\n请重启系统生效！`);
+        } else {
+          show_fail_modal(`备份恢复失败：${ret.msg}`, function() {
+            $("#modal-backup").modal('show');
+          });
+        }
+      });
     });
   });
+
+  // 备份文件信息预览（上传完成后自动调）
+  function inspect_uploaded_backup(file_name) {
+    ajax_post("inspect_backup", { file_name: file_name }, function (ret) {
+      const $box = $("#restore_inspect");
+      const $body = $("#restore_inspect_body");
+      if (!ret || ret.code !== 0 || !ret.info) {
+        $box.removeClass("alert-info").addClass("alert-warning")
+            .show();
+        $body.text(ret && ret.msg ? ret.msg : "无法读取备份文件");
+        return;
+      }
+      const info = ret.info;
+      const meta = info.metadata || {};
+      const pieces = [];
+      pieces.push(`<div>来源版本：<code>${meta.app_version || "未知"}</code> · 创建时间：<code>${meta.created_at || "未知"}</code></div>`);
+      pieces.push(`<div>来源 alembic：<code>${info.alembic_version || "无"}</code> · 本机 alembic：<code>${info.current_alembic_version || "无"}</code> · 本机版本：<code>${info.current_version || "未知"}</code></div>`);
+      pieces.push(`<div>包含：${info.has_config ? "config.yaml ✓ " : ""}${info.has_category ? "default-category.yaml ✓ " : ""}${info.has_db ? "user.db ✓ " : ""}</div>`);
+      const tableTop = (info.tables || []).filter(t => t.rows > 0).slice(0, 8)
+          .map(t => `${t.name}(${t.rows})`).join("、");
+      pieces.push(`<div>数据表：共 ${(info.tables || []).length} 张${tableTop ? "，含数据：" + tableTop : ""}${(info.tables || []).length > 8 ? " …" : ""}</div>`);
+      // 跨版本提示
+      if (info.alembic_version && info.current_alembic_version
+          && info.alembic_version !== info.current_alembic_version) {
+        pieces.push(`<div class="text-orange mt-1">⚠️ 检测到跨版本备份（alembic 不一致），建议使用<b>智能合并</b>模式。</div>`);
+        $("input[name='restore_mode'][value='merge']").prop("checked", true);
+      }
+      $box.removeClass("alert-warning").addClass("alert-info").show();
+      $body.html(pieces.join(""));
+    });
+  }
 
   //名称识别测试
   function name_test(btn_obj) {
@@ -512,5 +595,19 @@
   // 初始化DropZone
   backup_dropzone = new Dropzone("#back_file");
   backup_dropzone.options.acceptedFiles = ".zip";
+  backup_dropzone.on("success", function (file, resp) {
+    try {
+      // resp 可能是字符串
+      const data = typeof resp === "string" ? JSON.parse(resp) : resp;
+      if (data && data.code === 0) {
+        inspect_uploaded_backup(file.name);
+      }
+    } catch (e) {
+      // 忽略
+    }
+  });
+  backup_dropzone.on("removedfile", function () {
+    $("#restore_inspect").hide();
+  });
 
 </script>

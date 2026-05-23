@@ -323,6 +323,24 @@ class Downloader:
                 downloader=downloader, content=content, site_info=site_info, params=params)
 
             if not ret:
+                # 4.1) add 失败兜底：可能是种子已存在，按 in_from(订阅/刷流) 分流处理
+                action, dl_id, retmsg = self.__handle_existing_on_add_fail(
+                    media_info=media_info,
+                    downloader_id=downloader_id,
+                    downloader_name=downloader_name,
+                    params=params,
+                    in_from=in_from,
+                    torrent_file=torrent_file,
+                )
+                if action == "ok":
+                    log.info(f"【Downloader】{downloader_name} 种子已存在并按现有任务处理完成："
+                             f"{media_info.org_string}")
+                    return downloader_id, dl_id, ""
+                if action == "fail":
+                    # 已落过滤表，下次跳过；通知 + 返回失败
+                    self.__notify_download_fail(media_info, in_from, retmsg)
+                    return downloader_id, None, retmsg
+                # action == "unknown"：未识别为已存在，沿用旧失败返回
                 self.__notify_download_fail(media_info, in_from, "请检查下载任务是否已存在")
                 return downloader_id, None, f"下载器 {downloader_name} 添加下载任务失败，请检查下载任务是否已存在"
 
@@ -352,6 +370,164 @@ class Downloader:
         })
         if in_from:
             self.message.send_download_fail_message(media_info, f"添加下载任务失败：{msg}")
+
+    # =============== "种子已存在" 分流处理 ===============
+
+    def __handle_existing_on_add_fail(self, media_info, downloader_id,
+                                       downloader_name, params, in_from, torrent_file):
+        """
+        add_torrent 失败兜底：判断种子是否已经在下载器中；若是，则按 in_from（订阅/刷流）分流处理：
+        - 目录、标签、集数都一致 → ok（视为成功）
+        - 目录相同，标签不同 → 追加标签 → ok
+        - 目录相同（订阅+剧集且集数不同）→ 追加集数 → ok
+        - 目录不同 → 视为来源不一致，失败 + 写"过滤存量表"让下次跳过
+        :return: (action, dl_id, retmsg)，action ∈ {"ok","fail","unknown"}
+        """
+        # 仅订阅/刷流路径才走分流；其它(手动等)沿用旧失败返回
+        if in_from not in (SearchType.RSS, SearchType.BRUSH):
+            return "unknown", None, ""
+        existed_hash = self.__resolve_existing_download_id(
+            item=media_info, torrent_file=torrent_file, downloader_id=downloader_id)
+        if not existed_hash:
+            return "unknown", None, ""
+        log.info(f"【Downloader】{downloader_name} 检测到种子已存在于下载器（hash={existed_hash}），"
+                 f"开始按 {in_from.value if hasattr(in_from, 'value') else in_from} 路径分流处理")
+        return self.__handle_existing_torrent(
+            media_info=media_info,
+            downloader_id=downloader_id,
+            downloader_name=downloader_name,
+            existed_hash=existed_hash,
+            params=params,
+            in_from=in_from,
+        )
+
+    def __handle_existing_torrent(self, media_info, downloader_id, downloader_name,
+                                   existed_hash, params, in_from):
+        """
+        对已存在的种子按"目录/标签/集数"对比已存在任务，分别返回 ok / 追加 / 失败
+        """
+        client = self.__get_client(downloader_id)
+        if not client:
+            return "fail", None, "下载器未连接，无法处理已存在种子"
+        brief = client.get_torrent_brief(existed_hash) if hasattr(client, "get_torrent_brief") else None
+        if not brief:
+            return "fail", None, "种子已存在但读取已存在任务信息失败"
+
+        # 目录比较：normpath 严格相等
+        target_dir = params.get("download_dir") or ""
+        existing_dir = brief.get("save_path") or ""
+        same_dir = bool(target_dir) and bool(existing_dir) \
+                   and os.path.normpath(target_dir) == os.path.normpath(existing_dir)
+
+        # 标签集合
+        new_tags = {t for t in (params.get("tags") or []) if t}
+        existing_tags = brief.get("tags") or set()
+
+        # 集数（仅订阅 + 剧集 才考虑）
+        need_eps = []
+        try:
+            need_eps = media_info.get_episode_list() or []
+        except Exception:
+            need_eps = []
+        is_tv_eps = (in_from == SearchType.RSS
+                     and getattr(media_info, "type", None) == MediaType.TV
+                     and bool(need_eps))
+
+        if not same_dir:
+            # 目录不一致 → 失败 + 落过滤存量表
+            from_label = "刷流/手动" if in_from == SearchType.RSS else "订阅/手动"
+            log.warn(f"【Downloader】{downloader_name} 种子已存在但保存目录不一致："
+                     f"目标={target_dir} 已存在={existing_dir}，按 {in_from.value} 来源不匹配处理")
+            self.__record_existing_filter(
+                media_info=media_info,
+                downloader_id=downloader_id,
+                existed_hash=existed_hash,
+                in_from=in_from,
+            )
+            retmsg = (f"种子已存在于其它下载任务（来源：{from_label}），"
+                      f"目录不一致：{existing_dir}，请手动转移目录后重新下载；"
+                      f"已记录该种子，后续将自动跳过")
+            return "fail", None, retmsg
+
+        # 目录一致，按需追加 tag
+        missing_tags = list(new_tags - existing_tags)
+        if missing_tags:
+            try:
+                if hasattr(client, "add_torrent_tags"):
+                    client.add_torrent_tags(existed_hash, missing_tags)
+                    log.info(f"【Downloader】{downloader_name} 已对已存在种子追加标签："
+                             f"{missing_tags} (hash={existed_hash})")
+            except Exception as err:
+                ExceptionUtils.exception_traceback(err)
+                log.warn(f"【Downloader】{downloader_name} 追加标签出错：{str(err)}")
+
+        # 仅订阅 + 剧集才追加缺失集
+        if is_tv_eps:
+            try:
+                newly_selected, already_selected = self.set_files_status_append(
+                    tid=existed_hash, need_episodes=need_eps, downloader_id=downloader_id)
+                if newly_selected:
+                    log.info(f"【Downloader】{downloader_name} 已对已存在种子追加集数："
+                             f"{sorted(newly_selected)} (hash={existed_hash})")
+                    # 新追加文件需要把任务启动
+                    try:
+                        self.start_torrents(ids=existed_hash, downloader_id=downloader_id)
+                    except Exception:
+                        pass
+                else:
+                    log.info(f"【Downloader】{downloader_name} 目标集均已选中，无需追加："
+                             f"已选 {sorted(already_selected)}")
+            except Exception as err:
+                ExceptionUtils.exception_traceback(err)
+                log.warn(f"【Downloader】{downloader_name} 追加集数出错：{str(err)}")
+
+        return "ok", existed_hash, ""
+
+    def __record_existing_filter(self, media_info, downloader_id, existed_hash, in_from):
+        """
+        把"目录不一致的已存在种子"记录到对应的过滤存量表，下次自动跳过
+        - 订阅：写 RSS_TORRENTS（按 ENCLOSURE 命中跳过）
+        - 刷流：写 SITE_BRUSH_TORRENTS（按 (task_id,title,enclosure) 三联命中跳过）
+        - 通用：写 DOWNLOAD_HISTORY 备查
+        """
+        try:
+            enclosure = getattr(media_info, "enclosure", None) or ""
+            title = getattr(media_info, "org_string", None) or getattr(media_info, "title", "") or ""
+            if in_from == SearchType.RSS:
+                try:
+                    from app.helper import RssHelper
+                    RssHelper().simple_insert_rss_torrents(title=title, enclosure=enclosure)
+                except Exception as err:
+                    log.debug(f"【Downloader】写入 RSS_TORRENTS 过滤记录失败：{str(err)}")
+            elif in_from == SearchType.BRUSH:
+                brush_id = getattr(media_info, "brush_task_id", None)
+                if brush_id:
+                    try:
+                        size = getattr(media_info, "size", 0) or 0
+                        # download_id 用占位 "0" 避免被当作有效种子参与刷流删除/统计
+                        self.dbhelper.insert_brushtask_torrent(
+                            brush_id=brush_id,
+                            title=title,
+                            enclosure=enclosure,
+                            downloader=str(downloader_id) if downloader_id is not None else "",
+                            download_id="0",
+                            size=size,
+                        )
+                    except Exception as err:
+                        log.debug(f"【Downloader】写入 SITE_BRUSH_TORRENTS 过滤记录失败：{str(err)}")
+            # 通用：DOWNLOAD_HISTORY 备查（save_dir 标记为已存在以便排查）
+            try:
+                self.dbhelper.insert_download_history(
+                    media_info=media_info,
+                    downloader=str(downloader_id) if downloader_id is not None else "",
+                    download_id=existed_hash,
+                    save_dir="(existing)",
+                )
+            except Exception as err:
+                log.debug(f"【Downloader】写入 DOWNLOAD_HISTORY 失败：{str(err)}")
+        except Exception as err:
+            ExceptionUtils.exception_traceback(err)
+            log.warn(f"【Downloader】记录已存在过滤项异常：{str(err)}")
 
     def __resolve_torrent_content(self, media_info, torrent_file, proxy):
         """
@@ -486,9 +662,13 @@ class Downloader:
             return ret, download_id
 
         if downloader_type == DownloaderType.QB:
-            # 加临时 tag 反查 hash
-            torrent_tag = "NT" + StringUtils.generate_random_str(5)
-            tags = (tags or []) + [torrent_tag]
+            # 优先从 .torrent / magnet 内容直接计算 v1 infohash，作为 download_id（0 等待，且对"种子已存在"场景同样生效）
+            info_hash = None
+            try:
+                info_hash = downloader.compute_torrent_hash(content)
+            except Exception as e:
+                log.debug(f"【Downloader】计算 infohash 异常：{str(e)}")
+                info_hash = None
             ret = downloader.add_torrent(
                 content,
                 is_paused=params["is_paused"],
@@ -501,8 +681,17 @@ class Downloader:
                 ratio_limit=params["ratio_limit"],
                 seeding_time_limit=params["seeding_time_limit"],
                 cookie=site_info.get("cookie"))
-            download_id = downloader.get_torrent_id_by_tag(torrent_tag) if ret else None
-            return ret, download_id
+            if not ret:
+                return None, None
+            # 1) hash 已知：直接当 download_id（覆盖正常加种 / 已存在 / Conflict409 三种场景）
+            if info_hash:
+                # 短轮询确认 qb 中可见（多数情况下立即可见，最多兜底 10s）
+                download_id = downloader.get_torrent_id_by_hash(info_hash) or info_hash
+                return ret, download_id
+            # 2) 极端兜底：hash 解析失败时（罕见，例如非标准 .torrent / 网络 url 未下载到内容）
+            #    上层 __resolve_existing_download_id 会再尝试从 enclosure / page_url 解析 hash 兜底
+            log.warn(f"【Downloader】QB 加种成功但未能解析 infohash，download_id 留空交由上层兜底解析")
+            return ret, None
 
         # 其它下载器
         ret = downloader.add_torrent(

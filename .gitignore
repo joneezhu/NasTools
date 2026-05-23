@@ -17,3 +17,4 @@ package-lock.json
 package.json
 .release
 .release.local
+dist/
