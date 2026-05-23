@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# =============================================================================
+# NAStool 一键发布脚本
+#
+# 功能:
+#   1) 自动汇总上一个 tag 至 HEAD 的 commit, 清洗去重后生成 CHANGELOG 条目
+#   2) 自动修改 version.py, 提交 commit 并打带变更摘要的 annotated tag
+#   3) 推送 master 与 tag, 并通过 gh CLI 触发 Docker (build.yml) 与 Package (build-package.yml) 流水线
+#
+# 用法:
+#   scripts/release.sh <new_version>            # 例: scripts/release.sh v3.4.2 (默认不触发构建)
+#   scripts/release.sh <new_version> --build    # 推送后立即触发 docker / package 流水线
+#   scripts/release.sh <new_version> --dry-run  # 只演练不写入
+#   scripts/release.sh <new_version> --no-push  # 不 push 远端 (调试用)
+#   scripts/release.sh <new_version> --no-emoji # tag message 不使用 emoji 图标
+#   scripts/release.sh <new_version> --tag-limit=20  # tag message 条目上限 (默认 12)
+#
+# 默认行为:
+#   * 默认 *不* 触发 GitHub Actions, 仅生成 changelog / commit / tag / push。
+#     CI 触发改为按需手动触发, 避免误触发或在 tag 失败时产生僵尸 run。
+#   * 触发构建请加 --build, 此时会通过 gh workflow run 派发 build.yml 与 build-package.yml,
+#     且 ref 一律使用新 tag (而不是 master 分支), 这样 build-package.yml 出的 Release 会绑定到 tag。
+#
+# 凭据来源 (触发构建时需要):
+#   项目根目录 .release 文件 (KEY=VALUE 格式, 已 gitignore), 至少包含:
+#     DOCKER_USERNAME=...
+#     DOCKER_PASSWORD=...
+#     RELEASE_GH_TOKEN=...
+#   shell 中已设置的同名环境变量优先级更高, 会覆盖 .release 中的值。
+#
+# 依赖: git, gh (GitHub CLI), python3
+# =============================================================================
+set -euo pipefail
+
+# ---------- 工具 ----------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+log()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()  { echo -e "${RED}[ERR]${NC}   $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------- 参数 ----------
+NEW_VERSION="${1:-}"
+DRY_RUN=false
+RUN_BUILD=false        # 默认不触发 CI; 加 --build 才会跑
+NO_PUSH=false
+NO_EMOJI=false
+TAG_LIMIT=12
+shift || true
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)  DRY_RUN=true ;;
+    --build)    RUN_BUILD=true ;;
+    --no-build) RUN_BUILD=false ;;   # 兼容旧用法 (其实是默认值)
+    --no-push)  NO_PUSH=true ;;
+    --no-emoji) NO_EMOJI=true ;;
+    --tag-limit=*) TAG_LIMIT="${arg#*=}" ;;
+    *) die "未知参数: $arg" ;;
+  esac
+done
+
+[[ -z "$NEW_VERSION" ]] && die "用法: $0 <new_version> [--build] [--dry-run] [--no-push]"
+[[ "$NEW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] \
+  || die "版本号格式应为 vX.Y.Z 或 vX.Y.Z-suffix, 实际: $NEW_VERSION"
+
+# ---------- 路径 ----------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+VERSION_FILE="$REPO_ROOT/version.py"
+# 自 v3.4.x 起放弃 docs/CHANGELOG.md 单文件总账, 改为只维护单 tag 文件 docs/changelog/<tag>.md。
+# CHANGELOG.md 保留为静态导览 (说明 + 索引), 不再被 release.sh 写入。
+CHANGELOG_DIR="$REPO_ROOT/docs/changelog"
+RELEASE_ENV_FILE="$REPO_ROOT/.release"
+
+mkdir -p "$CHANGELOG_DIR"
+
+# ---------- 加载 .release 凭据 ----------
+# .release 是 KEY=VALUE 形式的环境文件 (已加入 .gitignore, 不会上传)
+# 至少需要: DOCKER_USERNAME / DOCKER_PASSWORD / RELEASE_GH_TOKEN
+if [[ -f "$RELEASE_ENV_FILE" ]]; then
+  log "加载 $RELEASE_ENV_FILE"
+  # 安全读取: 只允许 KEY=VALUE 形式的纯赋值, 自动过滤注释和空行
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    line="${raw_line%%#*}"          # 去掉 # 之后的注释
+    line="${line#"${line%%[![:space:]]*}"}"  # ltrim
+    line="${line%"${line##*[![:space:]]}"}"  # rtrim
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      key="${line%%=*}"
+      val="${line#*=}"
+      # 剥掉首尾成对的引号 (兼容 bash 3.2 的写法)
+      if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      fi
+      # shell 中已存在且非空的同名变量优先, 不覆盖
+      if [[ -z "${!key:-}" ]]; then
+        export "$key=$val"
+      fi
+    else
+      warn "$RELEASE_ENV_FILE 忽略非法行: $raw_line"
+    fi
+  done < "$RELEASE_ENV_FILE"
+else
+  warn "$RELEASE_ENV_FILE 不存在, 触发构建时将失败 (除非显式 --no-build)"
+fi
+
+# ---------- 前置校验 ----------
+log "校验工作区..."
+[[ -f "$VERSION_FILE"  ]] || die "未找到 $VERSION_FILE"
+[[ -d "$CHANGELOG_DIR"  ]] || mkdir -p "$CHANGELOG_DIR"
+
+if ! $DRY_RUN; then
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    die "工作区有未提交的修改, 先 stash 或 commit"
+  fi
+fi
+
+CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+[[ "$CUR_BRANCH" == "master" || "$CUR_BRANCH" == "main" ]] \
+  || warn "当前不在 master/main 分支 ($CUR_BRANCH), 仍可继续"
+
+# 拉最新
+$DRY_RUN || { log "git fetch --tags"; git fetch --tags --quiet; }
+
+# 取上一个 tag
+LAST_TAG="$(git tag --sort=-creatordate | head -n1 || true)"
+if [[ -z "$LAST_TAG" ]]; then
+  warn "未找到任何已有 tag, 将从首个 commit 起算"
+  RANGE_FROM="$(git rev-list --max-parents=0 HEAD | head -n1)"
+  RANGE_LABEL="(首次发布)"
+else
+  RANGE_FROM="$LAST_TAG"
+  RANGE_LABEL="$LAST_TAG"
+fi
+
+# 解析当前版本号
+CUR_VERSION="$(grep -E "^APP_VERSION" "$VERSION_FILE" | sed -E "s/.*'(v[^']+)'.*/\1/")"
+log "当前版本: $CUR_VERSION  ->  目标版本: $NEW_VERSION"
+log "Changelog 范围: $RANGE_LABEL  ->  HEAD"
+
+# 解析远端仓库 owner/repo, 用于生成 commit / issue 超链接
+REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
+OWNER_REPO="$(echo "$REMOTE_URL" | sed -E 's#.*github.com[:/](.*)\.git$#\1#')"
+if [[ -z "$OWNER_REPO" || "$OWNER_REPO" == "$REMOTE_URL" ]]; then
+  warn "无法从 origin 解析 GitHub owner/repo, changelog 将不带超链接"
+  OWNER_REPO=""
+fi
+
+# ---------- 已有 tag / Release / Docker 镜像状态判定 ----------
+# 完整发布物 = GitHub Release assets (binary 包) + Docker Hub 镜像 (stable 通道至少一个 tag)
+# 三种情况:
+#   A) tag 不存在                                    -> 完整流程 (生成 changelog / commit / tag / push / 触发 build.yml + build-package.yml)
+#   B) tag 已存在 + Release 有 asset + Docker 镜像有 -> 直接退出, 无事可做
+#   C) tag 已存在, 缺 asset 或缺 Docker 镜像          -> 跳过 commit/tag/push, 缺啥补啥 (按需派发 build.yml / build-package.yml)
+#
+# 这套判定主要为修复 v3.4.2-beta.1 这种半成品状态:
+# 首次发布时 build.yml 也 startup_failure (僵尸队列触发软配额), 导致 tag 存在但 Docker 镜像和 binary 都没出。
+# 老逻辑在场景 C 只重跑 build-package.yml, Docker 镜像永远补不出来。
+TAG_EXISTS=false
+PACKAGE_EXISTS=false           # GitHub Release asset 是否齐
+DOCKER_IMAGE_EXISTS=false      # Docker Hub 镜像是否齐
+SKIP_COMMIT_TAG=false
+ONLY_REBUILD_PACKAGE=false     # 仅重跑 build-package.yml
+ONLY_REBUILD_DOCKER=false      # 仅重跑 build.yml
+REBUILD_BOTH=false             # 两个都缺, 都重跑
+
+# 本地或远端任一存在即视为 tag 已存在
+if git rev-parse "$NEW_VERSION" >/dev/null 2>&1; then
+  TAG_EXISTS=true
+elif git ls-remote --tags --exit-code origin "refs/tags/$NEW_VERSION" >/dev/null 2>&1; then
+  TAG_EXISTS=true
+fi
+
+if $TAG_EXISTS; then
+  log "检测到 tag $NEW_VERSION 已存在, 检查 Release 安装包状态..."
+  if command -v gh >/dev/null 2>&1; then
+    # 先确认 gh 认证状态, 未认证时直接拒绝判定 (避免把"无权限"误判成"无安装包"导致重复发布)
+    if ! gh auth status >/dev/null 2>&1; then
+      die "tag $NEW_VERSION 已存在, 但 gh CLI 未登录, 无法判断 Release 是否已有安装包。
+      请先执行: gh auth login   (或在 .release 中配置 GH_TOKEN=\$RELEASE_GH_TOKEN)"
+    fi
+    # 临时关闭 errexit, gh release view 在 Release 不存在时会 exit 1
+    set +e
+    gh_release_json="$(gh release view "$NEW_VERSION" --json assets,tagName 2>/dev/null)"
+    gh_rc=$?
+    set -e
+    if [[ $gh_rc -eq 0 && -n "$gh_release_json" ]]; then
+      asset_count="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(len(d.get('assets', [])))" "$gh_release_json" 2>/dev/null || echo 0)"
+      if [[ "$asset_count" -gt 0 ]]; then
+        PACKAGE_EXISTS=true
+      fi
+      log "Release 状态: tag=$NEW_VERSION, assets=$asset_count"
+    else
+      log "未找到 $NEW_VERSION 的 GitHub Release"
+      asset_count=0
+    fi
+  else
+    die "tag $NEW_VERSION 已存在, 但未安装 gh CLI, 无法判断 Release 是否已有安装包。
+      请先安装: brew install gh, 然后 gh auth login"
+  fi
+
+  # 检查 Docker Hub 镜像是否存在 (stable 通道至少一个 tag 即视为成功)
+  # 优先级: $DOCKER_USERNAME -> 默认 joneezhu (与历史发布一致)
+  DOCKER_NS="${DOCKER_USERNAME:-joneezhu}"
+  DOCKER_REPO="${DOCKER_NS}/nastools"
+  log "检查 Docker Hub 镜像状态: $DOCKER_REPO:$NEW_VERSION"
+  set +e
+  docker_resp="$(curl -fsSL --max-time 10 "https://hub.docker.com/v2/repositories/${DOCKER_REPO}/tags/${NEW_VERSION}/" 2>/dev/null)"
+  docker_rc=$?
+  set -e
+  if [[ $docker_rc -eq 0 && -n "$docker_resp" ]]; then
+    # 有响应即存在 (404 时 curl -f 会非零退出, 不会走到这里)
+    DOCKER_IMAGE_EXISTS=true
+    log "Docker 镜像状态: $DOCKER_REPO:$NEW_VERSION 已存在"
+  else
+    log "Docker 镜像状态: $DOCKER_REPO:$NEW_VERSION 不存在"
+  fi
+
+  if $PACKAGE_EXISTS && $DOCKER_IMAGE_EXISTS; then
+    ok "tag $NEW_VERSION 已完整发布 (Release assets=$asset_count + Docker 镜像就位), 无需重复发布"
+    echo "    Release   : https://github.com/$(git config --get remote.origin.url \
+                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases/tag/$NEW_VERSION"
+    echo "    Docker    : https://hub.docker.com/r/${DOCKER_REPO}/tags?name=$NEW_VERSION"
+    exit 0
+  fi
+
+  # 半成品: 至少一个产物缺失, 决定补哪一边
+  SKIP_COMMIT_TAG=true
+  if ! $PACKAGE_EXISTS && ! $DOCKER_IMAGE_EXISTS; then
+    REBUILD_BOTH=true
+    warn "tag $NEW_VERSION 存在但 Release assets 与 Docker 镜像均缺失, 将重跑 build.yml + build-package.yml"
+  elif ! $PACKAGE_EXISTS; then
+    ONLY_REBUILD_PACKAGE=true
+    warn "tag $NEW_VERSION 存在但 Release 缺少安装包 (asset_count=$asset_count), 将仅重跑 build-package.yml"
+  else
+    ONLY_REBUILD_DOCKER=true
+    warn "tag $NEW_VERSION 存在但 Docker 镜像缺失, 将仅重跑 build.yml"
+  fi
+else
+  [[ "$CUR_VERSION" == "$NEW_VERSION" ]] && die "目标版本与当前版本相同 (且未打 tag), 请先确认 version.py"
+fi
+
+# ---------- 半成品补救模式 (场景 C) ----------
+if $SKIP_COMMIT_TAG; then
+  if $DRY_RUN; then
+    warn "--dry-run, 半成品补救模式: 不会实际派发 workflow"
+    if $REBUILD_BOTH;         then log "(本应触发) gh workflow run build.yml --ref $NEW_VERSION + build-package.yml"; fi
+    if $ONLY_REBUILD_PACKAGE; then log "(本应触发) gh workflow run build-package.yml --ref $NEW_VERSION"; fi
+    if $ONLY_REBUILD_DOCKER;  then log "(本应触发) gh workflow run build.yml --ref $NEW_VERSION"; fi
+    exit 0
+  fi
+  if ! $RUN_BUILD; then
+    warn "默认未触发 CI (加 --build 才会派发缺失的流水线)"
+    if $REBUILD_BOTH;         then echo "    缺: build.yml (Docker) + build-package.yml (binary)"; fi
+    if $ONLY_REBUILD_PACKAGE; then echo "    缺: build-package.yml (binary)"; fi
+    if $ONLY_REBUILD_DOCKER;  then echo "    缺: build.yml (Docker)"; fi
+    echo "    需要触发请运行: scripts/release.sh $NEW_VERSION --build"
+    exit 0
+  fi
+  : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN}"
+
+  REPO_PATH="$(git config --get remote.origin.url | sed -E 's#.*github.com[:/](.*)\.git#\1#')"
+
+  if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
+    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
+    : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
+    log "通过 gh 触发 build.yml (Docker Alpine + Debian, ref=$NEW_VERSION)..."
+    gh workflow run build.yml --ref "$NEW_VERSION" \
+      -f docker_username="$DOCKER_USERNAME" \
+      -f docker_password="$DOCKER_PASSWORD"
+    ok "build.yml 已派发 (ref=$NEW_VERSION)"
+  fi
+
+  if $REBUILD_BOTH || $ONLY_REBUILD_PACKAGE; then
+    log "通过 gh 触发 build-package.yml (基于已有 tag $NEW_VERSION 重新出包)..."
+    # build-package.yml 不接受任何 inputs (用 secrets.GITHUB_TOKEN 自动鉴权), 不要再传 -f github_token=...
+    gh workflow run build-package.yml --ref "$NEW_VERSION"
+    ok "build-package.yml 已派发 (ref=$NEW_VERSION)"
+  fi
+
+  echo
+  echo "    Actions    : https://github.com/${REPO_PATH}/actions"
+  if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
+    echo "    Docker Hub : https://hub.docker.com/r/${DOCKER_NS:-joneezhu}/nastools/tags?name=$NEW_VERSION"
+  fi
+  if $REBUILD_BOTH || $ONLY_REBUILD_PACKAGE; then
+    echo "    Releases   : https://github.com/${REPO_PATH}/releases/tag/$NEW_VERSION"
+  fi
+  echo
+  ok "已为已有 tag $NEW_VERSION 补全缺失产物 ✅"
+  exit 0
+fi
+
+# ---------- 收集 / 清洗 commit ----------
+log "收集 commit 并清洗..."
+
+RAW_LOG="$(git log "$RANGE_FROM..HEAD" --no-merges --pretty=format:'%H%x09%s%x09%an' || true)"
+[[ -z "$RAW_LOG" ]] && die "$RANGE_LABEL..HEAD 之间没有 commit, 没有可发布内容"
+
+# 用共享 python 脚本做去重 / 分类 / 过滤
+# scripts/_changelog_gen.py 同时被 release-github.sh 调用, 保证 Release 聚合时
+# 与单 tag 文件用同一份格式
+SHARED_GEN="$REPO_ROOT/scripts/_changelog_gen.py"
+[[ -f "$SHARED_GEN" ]] || die "缺少共享脚本: $SHARED_GEN"
+
+if $NO_EMOJI; then USE_EMOJI_VAL=0; else USE_EMOJI_VAL=1; fi
+PARSED="$(NEW_VERSION="$NEW_VERSION" RANGE_LABEL="$RANGE_LABEL" \
+  USE_EMOJI="$USE_EMOJI_VAL" TAG_LIMIT="$TAG_LIMIT" \
+  OWNER_REPO="$OWNER_REPO" \
+  python3 "$SHARED_GEN" <<<"$RAW_LOG")"
+
+extract() {
+  awk -v key="$1" '
+    $0 == key { capture=1; next }
+    capture && $0 == "MARK_END" { exit }
+    capture { print }
+  ' <<<"$PARSED"
+}
+
+CL_FILE_BODY="$(extract MARK_CHANGELOG_FILE)"
+TAG_MSG="$(extract MARK_TAG)"
+HIGHLIGHTS="$(extract MARK_HIGHLIGHTS)"
+
+[[ -z "$CL_FILE_BODY" ]] && die "单 tag changelog 文件解析失败"
+
+echo
+echo "============== 生成的 changelog (docs/changelog/${NEW_VERSION}.md) =============="
+echo "$CL_FILE_BODY"
+echo "============== 生成的 Tag message ================="
+echo "$TAG_MSG"
+echo "==================================================="
+echo
+
+if $DRY_RUN; then
+  warn "--dry-run, 不写入文件 / 不打 tag / 不 push / 不触发构建"
+  exit 0
+fi
+
+# ---------- 写 docs/changelog/<tag>.md (单 tag 单文件, 给 GitHub Release 用) ----------
+# 这是 changelog 的唯一落地点。docs/CHANGELOG.md 仅作静态导览, 不再被脚本写入。
+TAG_CHANGELOG_FILE="$CHANGELOG_DIR/${NEW_VERSION}.md"
+log "写入单 tag changelog: docs/changelog/${NEW_VERSION}.md"
+printf '%s\n' "$CL_FILE_BODY" > "$TAG_CHANGELOG_FILE"
+
+# ---------- 写 version.py ----------
+log "更新 version.py..."
+python3 - "$VERSION_FILE" "$NEW_VERSION" <<'PYEOF'
+import io, re, sys
+path, ver = sys.argv[1], sys.argv[2]
+with io.open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+new_text = re.sub(r"APP_VERSION\s*=\s*'[^']*'", f"APP_VERSION = '{ver}'", text)
+with io.open(path, "w", encoding="utf-8") as f:
+    f.write(new_text)
+print(f"APP_VERSION -> {ver}")
+PYEOF
+
+# ---------- commit & tag ----------
+log "提交版本 commit..."
+git add "$VERSION_FILE" "$TAG_CHANGELOG_FILE"
+git commit -m "release: bump version to $NEW_VERSION
+
+$HIGHLIGHTS"
+
+log "打 annotated tag $NEW_VERSION..."
+git tag -a "$NEW_VERSION" -F - <<EOF_TAG
+$TAG_MSG
+EOF_TAG
+
+ok "已创建 commit 与 tag $NEW_VERSION"
+
+# ---------- push ----------
+if $NO_PUSH; then
+  warn "--no-push, 不推送远端 (commit/tag 仅在本地)"
+else
+  log "推送 master 与 tag..."
+  git push origin "$CUR_BRANCH"
+  git push origin "$NEW_VERSION"
+  ok "已推送 $CUR_BRANCH 与 tag $NEW_VERSION"
+fi
+
+# ---------- 触发构建 ----------
+if ! $RUN_BUILD; then
+  warn "默认未触发 CI (本地已生成 commit/tag/changelog 并完成 push)"
+  echo
+  echo "    需要触发构建请运行 (会基于 tag $NEW_VERSION 派发 workflow):"
+  echo "      scripts/release.sh $NEW_VERSION --build"
+  echo "    或者直接手动:"
+  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=..."
+  echo "      gh workflow run build-package.yml --ref $NEW_VERSION"
+  echo
+  ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
+  exit 0
+fi
+if $NO_PUSH; then
+  warn "--no-push 时跳过构建触发 (流水线在远端 commit/tag 上跑)"
+  exit 0
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  warn "未安装 gh CLI, 请到 GitHub Actions 页面手动触发以下两条流水线 (ref 选 tag $NEW_VERSION):"
+  echo "    - .github/workflows/build.yml"
+  echo "    - .github/workflows/build-package.yml"
+  exit 0
+fi
+
+: "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (或去掉 --build)}"
+: "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (或去掉 --build)}"
+: "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN (或去掉 --build)}"
+
+# ref 一律用新 tag, 而非 master 分支:
+# 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
+# 2) 用分支名时, 如果之后该分支又有新 commit, ref 会漂移; 用 tag 永远精确指向本次发布
+log "通过 gh 触发 build.yml (Docker Hub Alpine + Debian, ref=$NEW_VERSION)..."
+gh workflow run build.yml --ref "$NEW_VERSION" \
+  -f docker_username="$DOCKER_USERNAME" \
+  -f docker_password="$DOCKER_PASSWORD"
+
+log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
+# build-package.yml 不再声明任何 inputs (改用 secrets.GITHUB_TOKEN), 不要传 -f github_token=...
+gh workflow run build-package.yml --ref "$NEW_VERSION"
+
+ok "构建已派发 (ref=$NEW_VERSION), 在 GitHub Actions 页面查看进度"
+echo
+echo "    Docker Hub : https://hub.docker.com/r/${DOCKER_USERNAME}/nastools/tags"
+echo "    Releases   : https://github.com/$(git config --get remote.origin.url \
+                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases"
+echo
+ok "Release $NEW_VERSION 已完成本地侧动作 ✅"

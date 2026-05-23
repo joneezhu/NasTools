@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import subprocess
 import time
 from math import floor
 from pathlib import Path
@@ -1216,41 +1217,172 @@ class WebAction:
 
     def update_system(self):
         """
-        更新
+        手动更新主程序代码
+        - 区分 群晖套件 / Docker 容器 / 其他（裸机 or 开发机）三种环境
+        - 每一步命令都打日志（命令、退出码、stdout/stderr 摘要）
+        - 任意一步失败立刻短路，**不重启**，返回 {code: 1, msg: ...} 让前端感知
+        - 前端日志也能在 系统设置→实时日志 里看到，搜关键字 [Update]
         """
-        # 升级
+        log.info("【Update】===== 收到手动更新请求 =====")
+
+        # ---- 1. 环境识别 ----
         if SystemUtils.is_synology():
-            if SystemUtils.execute('/bin/ps -w -x | grep -v grep | grep -w "nastool update" | wc -l') == '0':
-                # 调用群晖套件内置命令升级
-                os.system('nastool update')
-                # 重启
-                self.restart_server()
+            env = "synology"
+        elif SystemUtils.is_docker():
+            env = "docker"
+        elif SystemUtils.is_windows():
+            env = "windows"
         else:
-            # 清除git代理
-            os.system("sudo git config --global --unset http.proxy")
-            os.system("sudo git config --global --unset https.proxy")
-            # 设置git代理
-            proxy = Config().get_proxies() or {}
-            http_proxy = proxy.get("http")
-            https_proxy = proxy.get("https")
-            if http_proxy or https_proxy:
-                os.system(
-                    f"sudo git config --global http.proxy {http_proxy or https_proxy}")
-                os.system(
-                    f"sudo git config --global https.proxy {https_proxy or http_proxy}")
-            # 清理
-            os.system("sudo git clean -dffx")
-            # 升级
-            branch = os.getenv("NASTOOL_VERSION", "master")
-            os.system(f"sudo git fetch --depth 1 origin {branch}")
-            os.system(f"sudo git reset --hard origin/{branch}")
-            os.system("sudo git submodule update --init --recursive")
-            # 安装依赖
-            os.system('sudo pip install -r /nas-tools/requirements.txt')
-            # 修复权限
-            os.system('sudo chown -R nt:nt /nas-tools')
-            # 重启
+            env = "host"
+        branch = os.getenv("NASTOOL_VERSION", "master")
+        workdir = os.getenv("WORKDIR") or "/nas-tools"
+        log.info(f"【Update】运行环境: {env}  分支: {branch}  工作目录: {workdir}")
+
+        # ---- 2. 执行 helper ----
+        def _run(cmd, cwd=None, allow_fail=False, timeout=600):
+            """执行 shell 命令并把结果写到日志, 返回 (returncode, stdout, stderr)。"""
+            log.info(f"【Update】$ {cmd}" + (f"   (cwd={cwd})" if cwd else ""))
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                log.error(f"【Update】命令超时({timeout}s): {cmd}")
+                if allow_fail:
+                    return -1, "", "timeout"
+                raise
+            except Exception as e:
+                log.error(f"【Update】命令执行异常: {cmd}  错误: {e}")
+                if allow_fail:
+                    return -1, "", str(e)
+                raise
+            out = (proc.stdout or "").strip()
+            err = (proc.stderr or "").strip()
+            if out:
+                # 截断防止日志爆炸
+                snippet = out if len(out) <= 2000 else out[:2000] + " ...(truncated)"
+                log.info(f"【Update】[stdout]\n{snippet}")
+            if err:
+                snippet = err if len(err) <= 2000 else err[:2000] + " ...(truncated)"
+                log.warn(f"【Update】[stderr]\n{snippet}")
+            log.info(f"【Update】退出码: {proc.returncode}")
+            return proc.returncode, out, err
+
+        # ---- 3. 各环境执行流程 ----
+        try:
+            if env == "synology":
+                # 群晖：调用套件命令
+                running = SystemUtils.execute(
+                    '/bin/ps -w -x | grep -v grep | grep -w "nastool update" | wc -l'
+                )
+                log.info(f"【Update】群晖检测：当前 'nastool update' 进程数 = {running}")
+                if running != "0":
+                    log.warn("【Update】已有更新进程在跑，本次不重复触发")
+                    return {"code": 1, "msg": "已有更新进程在执行，请稍后再试"}
+                rc, _, _ = _run("nastool update", timeout=1800)
+                if rc != 0:
+                    log.error(f"【Update】群晖 nastool update 失败 rc={rc}，不重启")
+                    return {"code": 1, "msg": f"群晖更新命令失败 (rc={rc})，详情查看日志"}
+                log.info("【Update】群晖更新成功，准备重启服务")
+
+            elif env == "docker":
+                # Docker：在容器内做 git 升级。**不再使用 sudo**（容器里不一定有 sudo）。
+                # 重要：无论成功失败都不要再装 pip 依赖（重型操作交给镜像启动时的 init-010-update）。
+                if not os.path.isdir(os.path.join(workdir, ".git")):
+                    msg = f"工作目录 {workdir} 不是 git 仓库，无法手动更新（请重启容器走启动升级流程）"
+                    log.error(f"【Update】{msg}")
+                    return {"code": 1, "msg": msg}
+
+                # 清理 git 代理
+                _run("git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
+                _run("git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
+
+                # 配置代理（如果有）
+                proxies = (Config().get_proxies() or {})
+                http_proxy = proxies.get("http")
+                https_proxy = proxies.get("https")
+                if http_proxy or https_proxy:
+                    _run(f"git config --global http.proxy {http_proxy or https_proxy}",
+                         cwd=workdir, allow_fail=True)
+                    _run(f"git config --global https.proxy {https_proxy or http_proxy}",
+                         cwd=workdir, allow_fail=True)
+                    log.info(f"【Update】已配置 git 代理: {http_proxy or https_proxy}")
+
+                # 记录更新前 commit 方便排查
+                _run("git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
+
+                # 拉取并强制重置
+                rc, _, _ = _run(f"git fetch --depth 1 origin {branch}", cwd=workdir, timeout=600)
+                if rc != 0:
+                    return {"code": 1, "msg": f"git fetch 失败 (rc={rc})，详情查看日志"}
+                rc, _, _ = _run(f"git reset --hard origin/{branch}", cwd=workdir)
+                if rc != 0:
+                    return {"code": 1, "msg": f"git reset 失败 (rc={rc})，详情查看日志"}
+                _run("git submodule update --init --recursive", cwd=workdir, allow_fail=True, timeout=600)
+
+                # 记录更新后 commit
+                _run("git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
+                log.info("【Update】Docker 容器内代码更新完成，准备重启服务")
+                log.warn(
+                    "【Update】注意：手动更新只 git pull 代码，**不会**重新安装 requirements 与 third_party。"
+                    " 如需完整升级请重启容器（容器启动会跑 init-010-update 完成依赖更新）。"
+                )
+
+            elif env == "windows":
+                msg = "Windows 环境暂不支持网页一键更新，请手动 git pull 后重启"
+                log.warn(f"【Update】{msg}")
+                return {"code": 1, "msg": msg}
+
+            else:
+                # 裸机：保留原有 sudo 流程，但加上日志和失败短路
+                _run("sudo git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
+                _run("sudo git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
+                proxies = (Config().get_proxies() or {})
+                http_proxy = proxies.get("http")
+                https_proxy = proxies.get("https")
+                if http_proxy or https_proxy:
+                    _run(f"sudo git config --global http.proxy {http_proxy or https_proxy}",
+                         cwd=workdir, allow_fail=True)
+                    _run(f"sudo git config --global https.proxy {https_proxy or http_proxy}",
+                         cwd=workdir, allow_fail=True)
+
+                _run("sudo git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
+                _run("sudo git clean -dffx", cwd=workdir, allow_fail=True)
+                rc, _, _ = _run(f"sudo git fetch --depth 1 origin {branch}", cwd=workdir, timeout=600)
+                if rc != 0:
+                    return {"code": 1, "msg": f"git fetch 失败 (rc={rc})，详情查看日志"}
+                rc, _, _ = _run(f"sudo git reset --hard origin/{branch}", cwd=workdir)
+                if rc != 0:
+                    return {"code": 1, "msg": f"git reset 失败 (rc={rc})，详情查看日志"}
+                _run("sudo git submodule update --init --recursive", cwd=workdir, allow_fail=True, timeout=600)
+                _run("sudo git rev-parse --short HEAD", cwd=workdir, allow_fail=True)
+                # 安装依赖
+                rc, _, _ = _run(f"sudo pip install -r {workdir}/requirements.txt",
+                                cwd=workdir, allow_fail=True, timeout=900)
+                if rc != 0:
+                    log.warn(f"【Update】依赖安装返回非 0 (rc={rc})，已忽略继续重启")
+                # 修复权限
+                _run(f"sudo chown -R nt:nt {workdir}", allow_fail=True)
+                log.info("【Update】裸机环境代码与依赖更新完成，准备重启服务")
+
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【Update】更新过程抛出异常: {e}")
+            return {"code": 1, "msg": f"更新异常: {e}"}
+
+        # ---- 4. 全部成功才重启 ----
+        log.info("【Update】===== 更新成功，开始重启服务 =====")
+        try:
             self.restart_server()
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"【Update】重启服务失败: {e}")
+            return {"code": 1, "msg": f"代码已更新但重启失败: {e}"}
         return {"code": 0}
 
     @staticmethod

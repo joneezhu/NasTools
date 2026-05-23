@@ -2,9 +2,20 @@ FROM python:3.10.11-slim-bullseye
 COPY --from=shinsenter/s6-overlay / /
 RUN set -xe && \
     export DEBIAN_FRONTEND="noninteractive" && \
+    # apt 网络加固: 重试 + 超时, 避免 deb.debian.org (Fastly CDN) 偶发 connection reset 直接挂掉
+    echo 'Acquire::Retries "5";'                       >  /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::Timeout "60";'                >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::https::Timeout "60";'               >> /etc/apt/apt.conf.d/80-retries && \
+    echo 'Acquire::http::No-Cache "true";'             >> /etc/apt/apt.conf.d/80-retries && \
     apt-get update -y && \
-    apt-get install -y wget bash && \
-    apt-get install -y $(echo $(wget --no-check-certificate -qO- https://raw.githubusercontent.com/joneezhu/NasTools/master/package_list_debian.txt)) && \
+    apt-get install -y --fix-missing wget bash && \
+    PKG_LIST="$(wget --no-check-certificate -qO- https://raw.githubusercontent.com/joneezhu/NasTools/master/package_list_debian.txt)" && \
+    # 整体最多重试 3 次, 每次失败先 apt-get update 刷镜像 metadata 再装
+    APT_OK=0 && for i in 1 2 3; do \
+        if apt-get install -y --fix-missing $PKG_LIST; then APT_OK=1; break; fi; \
+        echo "[apt] install attempt $i failed, retrying..."; sleep 5; apt-get update -y || true; \
+    done && \
+    [ "$APT_OK" = "1" ] || { echo "[apt] install failed after 3 attempts"; exit 1; } && \
     ln -sf /command/with-contenv /usr/bin/with-contenv && \
     # zone time
     ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime && \
@@ -27,8 +38,8 @@ RUN set -xe && \
     # Pip requirements prepare
     apt-get install -y build-essential && \
     # Pip requirements
-    pip install --upgrade pip setuptools wheel && \
-    pip install cython && \
+    pip install --upgrade pip 'setuptools<70' wheel cython && \
+    pip install --no-build-isolation 'fast-bencode==1.1.3' && \
     pip install -r https://raw.githubusercontent.com/joneezhu/NasTools/master/requirements.txt && \
     # Clear
     apt-get remove -y build-essential && \

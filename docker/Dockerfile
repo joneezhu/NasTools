@@ -1,17 +1,27 @@
 FROM python:3.10.11-alpine
-RUN apk add --no-cache --virtual .build-deps \
+RUN set -xe \
+    && apk add --no-cache --virtual .build-deps \
         libffi-dev \
         gcc \
         musl-dev \
         libxml2-dev \
         libxslt-dev \
-    && apk add --no-cache $(echo $(wget --no-check-certificate -qO- https://raw.githubusercontent.com/joneezhu/NasTools/master/package_list.txt)) \
+    # apk 大批量装包重试 3 次, 兜底 dl-cdn.alpinelinux.org 偶发抖动
+    && PKG_LIST="$(wget --no-check-certificate -qO- https://raw.githubusercontent.com/joneezhu/NasTools/master/package_list.txt)" \
+    && APK_OK=0 && for i in 1 2 3; do \
+           if apk add --no-cache $PKG_LIST; then APK_OK=1; break; fi; \
+           echo "[apk] install attempt $i failed, retrying..."; sleep 5; \
+       done \
+    && [ "$APK_OK" = "1" ] || { echo "[apk] install failed after 3 attempts"; exit 1; } \
     && curl https://rclone.org/install.sh | bash \
     && if [ "$(uname -m)" = "x86_64" ]; then ARCH=amd64; elif [ "$(uname -m)" = "aarch64" ]; then ARCH=arm64; fi \
     && curl https://dl.min.io/client/mc/release/linux-${ARCH}/mc --create-dirs -o /usr/bin/mc \
     && chmod +x /usr/bin/mc \
-    && pip install --upgrade pip setuptools wheel \
-    && pip install cython \
+    # fast-bencode==1.1.3 是上古 sdist, 不兼容 setuptools 70+
+    # 必须先钉死外层 setuptools<70, 再用 --no-build-isolation 让 fast-bencode 复用外层环境
+    # (默认 pip 会给每个 sdist 单独建 overlay 装最新 setuptools, 把我们钉的版本架空)
+    && pip install --upgrade pip 'setuptools<70' wheel cython \
+    && pip install --no-build-isolation 'fast-bencode==1.1.3' \
     && pip install -r https://raw.githubusercontent.com/joneezhu/NasTools/master/requirements.txt \
     && apk del --purge .build-deps \
     && rm -rf /tmp/* /root/.cache /var/cache/apk/*
