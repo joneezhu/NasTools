@@ -4,8 +4,8 @@
 [![GitHub forks](https://img.shields.io/github/forks/joneezhu/NasTools?style=plastic)](https://github.com/joneezhu/NasTools/network/members)
 [![GitHub issues](https://img.shields.io/github/issues/joneezhu/NasTools?style=plastic)](https://github.com/joneezhu/NasTools/issues)
 [![GitHub license](https://img.shields.io/github/license/joneezhu/NasTools?style=plastic)](https://github.com/joneezhu/NasTools/blob/master/LICENSE.md)
-[![Docker pulls](https://img.shields.io/docker/pulls/joneezhu/NasTools?style=plastic)](https://hub.docker.com/r/joneezhu/NasTools)
-[![Platform](https://img.shields.io/badge/platform-amd64/arm64-pink?style=plastic)](https://hub.docker.com/r/joneezhu/NasTools)
+[![Docker pulls](https://img.shields.io/docker/pulls/joneezhu/NasTools?style=plastic)](https://hub.docker.com/r/joneechu/nastools)
+[![Platform](https://img.shields.io/badge/platform-amd64/arm64-pink?style=plastic)](https://hub.docker.com/r/joneechu/nastools)
 
 ## 维护声明
 
@@ -19,7 +19,7 @@
 
 基于官方 3.2.3 版本
 
-[开发路线](https://github.com/joneezhu/NasTools/discussions/91)
+[开发路线](https://github.com/joneezhu/NasTools/tree/master/docs/changelog)
 
 - [x] 支持Aria2/115/PikPak下载器
 - [x] 支持chromedriver114版本以上的谷歌浏览器
