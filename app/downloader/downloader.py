@@ -662,9 +662,13 @@ class Downloader:
             return ret, download_id
 
         if downloader_type == DownloaderType.QB:
-            # 加临时 tag 反查 hash
-            torrent_tag = "NT" + StringUtils.generate_random_str(5)
-            tags = (tags or []) + [torrent_tag]
+            # 优先从 .torrent / magnet 内容直接计算 v1 infohash，作为 download_id（0 等待，且对"种子已存在"场景同样生效）
+            info_hash = None
+            try:
+                info_hash = downloader.compute_torrent_hash(content)
+            except Exception as e:
+                log.debug(f"【Downloader】计算 infohash 异常：{str(e)}")
+                info_hash = None
             ret = downloader.add_torrent(
                 content,
                 is_paused=params["is_paused"],
@@ -677,8 +681,17 @@ class Downloader:
                 ratio_limit=params["ratio_limit"],
                 seeding_time_limit=params["seeding_time_limit"],
                 cookie=site_info.get("cookie"))
-            download_id = downloader.get_torrent_id_by_tag(torrent_tag) if ret else None
-            return ret, download_id
+            if not ret:
+                return None, None
+            # 1) hash 已知：直接当 download_id（覆盖正常加种 / 已存在 / Conflict409 三种场景）
+            if info_hash:
+                # 短轮询确认 qb 中可见（多数情况下立即可见，最多兜底 10s）
+                download_id = downloader.get_torrent_id_by_hash(info_hash) or info_hash
+                return ret, download_id
+            # 2) 极端兜底：hash 解析失败时（罕见，例如非标准 .torrent / 网络 url 未下载到内容）
+            #    上层 __resolve_existing_download_id 会再尝试从 enclosure / page_url 解析 hash 兜底
+            log.warn(f"【Downloader】QB 加种成功但未能解析 infohash，download_id 留空交由上层兜底解析")
+            return ret, None
 
         # 其它下载器
         ret = downloader.add_torrent(
