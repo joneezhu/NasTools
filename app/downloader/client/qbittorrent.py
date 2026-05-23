@@ -494,10 +494,96 @@ class Qbittorrent(_IDownloadClient):
                                             seeding_time_limit=seeding_time_limit,
                                             use_auto_torrent_management=is_auto,
                                             cookie=cookie)
-            return True if qbc_ret and str(qbc_ret).find("Ok") != -1 else False
-        except Exception as err:
-            log.error(f"【{self.client_name}】{self.name} 添加种子出错：{str(err)}")
+            if qbc_ret and str(qbc_ret).find("Ok") != -1:
+                return True
+            # qb 返回非 Ok（含 "Fails."），说明被服务端拒绝；尝试事后比对，可能是种子已存在
+            if self.__exists_in_qb(urls=urls, tag=tags):
+                log.warn(
+                    f"【{self.client_name}】{self.name} 种子已存在于下载器中（torrents_add 返回 {qbc_ret}），"
+                    f"视为添加成功 | save_path={save_path}, tags={tags}"
+                )
+                return True
+            log.error(
+                f"【{self.client_name}】{self.name} 添加种子失败：torrents_add 返回 {qbc_ret} | "
+                f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}"
+            )
             return False
+        except qbittorrentapi.Conflict409Error as err:
+            # 409 Conflict 常见原因：种子已存在 / 分类校验失败等。先做事后比对再判定。
+            if self.__exists_in_qb(urls=urls, tag=tags):
+                log.warn(
+                    f"【{self.client_name}】{self.name} 种子已存在于下载器中（Conflict409），"
+                    f"视为添加成功 | save_path={save_path}, tags={tags}"
+                )
+                return True
+            log.error(
+                f"【{self.client_name}】{self.name} 添加种子出错(Conflict409，且未在下载器中找到匹配种子)："
+                f"{str(err) or '无详细信息'} | "
+                f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}"
+            )
+            return False
+        except Exception as err:
+            # 其它异常：仍尝试事后比对，避免网络抖动等导致状态不同步
+            try:
+                if self.__exists_in_qb(urls=urls, tag=tags):
+                    log.warn(
+                        f"【{self.client_name}】{self.name} 添加种子异常但事后比对发现种子已存在，视为成功："
+                        f"{type(err).__name__}: {str(err) or '无详细信息'} | tags={tags}"
+                    )
+                    return True
+            except Exception:
+                pass
+            log.error(
+                f"【{self.client_name}】{self.name} 添加种子出错："
+                f"{type(err).__name__}: {str(err) or '无详细信息'} | "
+                f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}"
+            )
+            return False
+
+    def __exists_in_qb(self, urls=None, tag=None):
+        """
+        事后比对：判断刚才尝试添加的种子是否其实已经在下载器中。
+        优先用 tag 反查（NasTools 添加种子时通常会带唯一 tag），其次再退化到按 url 解析 hash。
+        :param urls: 添加时使用的 url（字符串或 list/tuple，可能为 None）
+        :param tag: 添加时使用的 tag（字符串或 list/tuple，可能为 None）
+        :return: bool
+        """
+        if not self.qbc:
+            return False
+        # 1) 通过 tag 反查（最稳：NasTools 在 add_torrent 阶段会传入唯一 tag，
+        #    若 qb 已存在同 hash 种子，新打的 tag 会被合并到既有种子上）
+        try:
+            if tag:
+                tag_list = tag if isinstance(tag, (list, tuple)) else [tag]
+                for t in tag_list:
+                    if not t:
+                        continue
+                    torrents, err = self.get_torrents(tag=t)
+                    if err:
+                        continue
+                    if torrents:
+                        return True
+        except Exception as e:
+            log.debug(f"【{self.client_name}】{self.name} 按 tag 反查种子异常：{str(e)}")
+        # 2) 通过 url 中可能携带的 infohash 反查（兜底，多数 PT 站 url 不含 hash，因此命中率有限）
+        try:
+            if urls:
+                url_list = urls if isinstance(urls, (list, tuple)) else [urls]
+                for u in url_list:
+                    if not u:
+                        continue
+                    m = re.search(r"([0-9a-fA-F]{40})", str(u))
+                    if not m:
+                        continue
+                    info_hash = m.group(1).lower()
+                    torrents, err = self.get_torrents(ids=info_hash)
+                    if err:
+                        continue
+                    if torrents:
+                        return True
+        except Exception as e:
+            log.debug(f"【{self.client_name}】{self.name} 按 hash 反查种子异常：{str(e)}")
+        return False
 
     def start_torrents(self, ids):
         if not self.qbc:
