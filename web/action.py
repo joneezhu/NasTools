@@ -2424,7 +2424,7 @@ class WebAction:
         brushtask_exclude = data.get("brushtask_exclude")
         brushtask_dlcount = data.get("brushtask_dlcount")
         brushtask_current_site_count = data.get("brushtask_current_site_count")
-        brushtask_current_site_dlcount = data.get("dl")
+        brushtask_current_site_dlcount = data.get("brushtask_current_site_dlcount")
         brushtask_peercount = data.get("brushtask_peercount")
         brushtask_seedtime = data.get("brushtask_seedtime")
         brushtask_seedratio = data.get("brushtask_seedratio")
@@ -2478,8 +2478,12 @@ class WebAction:
             "remove_rule": remove_rule,
             "sendmessage": brushtask_sendmessage
         }
-        BrushTask().update_brushtask(brushtask_id, item)
-        return {"code": 0}
+        try:
+            BrushTask().update_brushtask(brushtask_id, item)
+            return {"code": 0}
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {"code": 1, "msg": f"保存刷流任务失败：{str(e)}"}
 
     @staticmethod
     def __del_brushtask(data):

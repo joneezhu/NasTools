@@ -970,6 +970,11 @@
 
   // 新增任务保存
   function add_brushtask_job() {
+    // 防止重复点击
+    let $btn = $("#brushtask_add_btn");
+    if ($btn.hasClass("disabled")) {
+      return;
+    }
     // 检查输入项
     let brushtask_id = $("#brushtask_id").val();
     let brushtask_name = $("#brushtask_name").val();
@@ -1222,7 +1227,15 @@
       brushtask_pubdate: brushtask_pubdate_do + "#" + brushtask_pubdate
     };
 
+    // 进入提交态：按钮置灰 + loading
+    $btn.addClass("disabled").html('<span class="spinner-border spinner-border-sm me-2" role="status"></span>保存中...');
+
     ajax_post("add_brushtask", params, function (ret) {
+      $btn.removeClass("disabled").text("确定");
+      if (ret && ret.code !== 0) {
+        show_fail_modal(ret.msg || "保存失败，请稍后重试");
+        return;
+      }
       $("#modal-brushtask").modal('hide');
       window_history_refresh();
     });
