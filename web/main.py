@@ -169,7 +169,6 @@ def login():
                                img_link=img_link,
                                err_msg=errmsg)
 
-    log.info("from: %s" % request.access_route)
     proxy_ip = request.environ.get('werkzeug.proxy_fix.orig', {}).get('REMOTE_ADDR') or request.remote_addr
 
     # 获取forward auth相关配置

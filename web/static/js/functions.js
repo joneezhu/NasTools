@@ -351,10 +351,19 @@ function update(version) {
   }
   show_confirm_modal(title, function () {
     hide_confirm_modal();
-    ajax_post("update_system", {}, function (ret) {
-    }, true, false)
     show_wait_modal(true);
-    back_to_login_page("update_system");
+    // 后端成功才会重启进程, 失败时返回 {code:1, msg:...} 让前端能感知
+    ajax_post("update_system", {}, function (ret) {
+      if (ret && ret.code === 0) {
+        // 成功路径: 后端马上会 restart_server, 进程会断, 等待重启完成后回登录页
+        back_to_login_page("update_system");
+      } else {
+        // 失败路径: 关掉等待框, 弹错误信息, **不要登出**, 这样用户能继续看实时日志排查
+        hide_wait_modal();
+        const msg = (ret && ret.msg) ? ret.msg : "更新失败，请到 系统设置 → 实时日志 查看 [Update] 关键字";
+        show_fail_modal("更新失败：" + msg);
+      }
+    }, true, false);
   });
 }
 
