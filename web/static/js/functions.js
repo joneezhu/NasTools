@@ -352,8 +352,27 @@ function update(version) {
   show_confirm_modal(title, function () {
     hide_confirm_modal();
     show_wait_modal(true);
+
+    // 客户端兜底超时：3 分钟。后端正常成功会触发 back_to_login_page（9s 内自动跳转登录页）；
+    // 后端正常失败会进入 ret.code===1 分支弹错误。
+    // 但群晖/裸机场景下 restart 可能让 web 进程被杀，请求永远等不到响应，
+    // 这时靠这里的 client timeout 兜底，不再无限转圈。
+    let updateDone = false;
+    const updateTimeoutTimer = setTimeout(function () {
+      if (updateDone) return;
+      updateDone = true;
+      hide_wait_modal();
+      show_fail_modal(
+        "更新等待超时（3 分钟）。可能服务正在重启或后台仍在执行，" +
+        "请稍后刷新页面查看版本号。如果版本未变，请到 系统设置 → 实时日志 搜索 [Update] 查看详情。"
+      );
+    }, 180000);
+
     // 后端成功才会重启进程, 失败时返回 {code:1, msg:...} 让前端能感知
     ajax_post("update_system", {}, function (ret) {
+      if (updateDone) return;
+      updateDone = true;
+      clearTimeout(updateTimeoutTimer);
       if (ret && ret.code === 0) {
         // 成功路径: 后端马上会 restart_server, 进程会断, 等待重启完成后回登录页
         back_to_login_page("update_system");

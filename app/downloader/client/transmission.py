@@ -190,6 +190,75 @@ class Transmission(_IDownloadClient):
         except Exception as err:
             log.error(f"【{self.client_name}】{self.name} 设置种子标签出错：{str(err)}")
 
+    def add_torrent_tags(self, ids, tags):
+        """
+        给已存在的种子追加标签（读后合并写入，不覆盖原有 labels）
+        :param ids: 单个 hash/id 或 list
+        :param tags: 单个 tag 或 list
+        :return: bool
+        """
+        if not self.trc or not ids or not tags:
+            return False
+        try:
+            new_tags = tags if isinstance(tags, (list, tuple, set)) else [tags]
+            new_tags = [t for t in new_tags if t]
+            if not new_tags:
+                return False
+            target_ids = self.__parse_ids(ids)
+            torrents = self.trc.get_torrents(ids=target_ids, arguments=self._trarg)
+            for torrent in torrents or []:
+                old_labels = list(getattr(torrent, "labels", []) or [])
+                merged = list(set(old_labels) | set(new_tags))
+                self.trc.change_torrent(labels=merged, ids=torrent.id)
+            return True
+        except Exception as err:
+            log.error(f"【{self.client_name}】{self.name} 追加标签出错：{str(err)}")
+            return False
+
+    def get_torrent_brief(self, tid):
+        """
+        获取已存在种子的关键信息：保存目录 / 标签集合 / 文件列表（统一结构）
+        :param tid: hash 或 id
+        :return: {"hash","save_path","tags"(set),"files"(list[{name,selected}])} 或 None
+        """
+        if not self.trc or not tid:
+            return None
+        try:
+            target_ids = self.__parse_ids(tid)
+            torrents = self.trc.get_torrents(ids=target_ids, arguments=self._trarg)
+            if not torrents:
+                return None
+            torrent = torrents[0]
+            # 兼容不同版本 transmissionrpc 的字段命名
+            save_path = getattr(torrent, "download_dir", None) or getattr(torrent, "downloadDir", "") or ""
+            t_hash = getattr(torrent, "hashString", None) or getattr(torrent, "hash_string", "") or ""
+            tag_set = set(getattr(torrent, "labels", []) or [])
+            files = []
+            try:
+                raw_files = torrent.files() if hasattr(torrent, "files") else []
+                for f in raw_files or []:
+                    if isinstance(f, dict):
+                        files.append({
+                            "name": f.get("name"),
+                            "selected": bool(f.get("selected", True))
+                        })
+                    else:
+                        files.append({
+                            "name": getattr(f, "name", None),
+                            "selected": bool(getattr(f, "selected", True))
+                        })
+            except Exception as ferr:
+                log.debug(f"【{self.client_name}】{self.name} 读取已存在种子文件列表异常：{str(ferr)}")
+            return {
+                "hash": t_hash,
+                "save_path": save_path,
+                "tags": tag_set,
+                "files": files,
+            }
+        except Exception as err:
+            log.error(f"【{self.client_name}】{self.name} 读取种子摘要出错：{str(err)}")
+            return None
+
     def change_torrent(self,
                        tid,
                        tag=None,
