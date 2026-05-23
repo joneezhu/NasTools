@@ -18,21 +18,12 @@
 ## 开发路线及官方原版新增内容
 
 基于官方 3.2.3 版本
+基于 [hsuyelin's NasTool](https://github.com/hsuyelin/nas-tools) 3.4.1 版本继续开发维护
+旷神spk已停止维护，推荐使用docker版运行
 
-[开发路线](https://github.com/joneezhu/NasTools/tree/master/docs/changelog)
+更新历史请查看 [开发路线](https://github.com/joneezhu/NasTools/tree/master/docs/changelog)
 
-- [x] 支持Aria2/115/PikPak下载器
-- [x] 支持chromedriver114版本以上的谷歌浏览器
-- [x] 支持识别历史记录一键清理
-- [x] 支持通过插件安装Jackett和Prowlarr扩展内置索引
-- [x] 支持TMDB搜索18+内容
-- [x] 支持通过开关控制刮削时是否刮削视频实际媒体信息
-- [x] 支持管理我的媒体库显示模块
-- [x] 修复官方版豆瓣图片无法显示
-- [x] 修复官方原版豆瓣同步方式近期动态与全量同步失效
-- [x] 修复官方原版高清空间签到cookies错误
-- [x] 持续更新索引站点
-- [x] 更多功能请查阅 [版本发布](https://github.com/joneezhu/NasTools/releases)  更新日志 
+更多版本请查看 [版本发布](https://github.com/joneezhu/NasTools/releases)
 
 ## 安装
 ### 1、Docker
