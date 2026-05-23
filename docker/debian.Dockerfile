@@ -38,7 +38,7 @@ RUN set -xe && \
     # Pip requirements prepare
     apt-get install -y build-essential && \
     # Pip requirements
-    pip install --upgrade pip 'setuptools<70' wheel cython && \
+    pip install --upgrade 'pip<25' 'setuptools<70' wheel cython && \
     pip install --no-build-isolation 'fast-bencode==1.1.3' && \
     pip install -r https://raw.githubusercontent.com/joneezhu/NasTools/master/requirements.txt && \
     # Clear

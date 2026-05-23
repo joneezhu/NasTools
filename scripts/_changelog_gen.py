@@ -47,14 +47,11 @@ if not raw:
     print("- 区间内无 commit (可能是直接重打 tag)")
     print("MARK_END")
     print("MARK_TAG")
-    print(f"# Release {new_version}")
+    print(f"Release {new_version}")
+    print(f"Date  : {today}")
+    print(f"Range : {prev_label} -> {new_version}")
     print()
-    print(f"- **Date**: {today}")
-    print(f"- **Range**: {prev_label} → {new_version}")
-    print()
-    print("---")
-    print()
-    print("_无 commit (可能是直接重打 tag)_")
+    print("(no commits in range -- likely a re-tag)")
     print("MARK_END")
     print("MARK_HIGHLIGHTS")
     print("MARK_END")
@@ -180,8 +177,10 @@ print("\n".join(file_lines).rstrip())
 print("MARK_END")
 
 # ---------- MARK_TAG ----------
-# 注意: GitHub tag 页 (releases/tag/<t>) 会把 annotated tag message 当 markdown 渲染,
-#       所以这里输出和 MARK_CHANGELOG_FILE 同款的 markdown, 让 commit / PR 都能跳转
+# 注意: git CLI (git show <tag> / git tag -l --format='%(contents)') 显示纯文本,
+#       markdown 标记 (#/[]/()) 会变成视觉噪音; 而 GitHub web 上 tag 页一旦有
+#       Release.body 就会用 body 覆盖, 不读 tag message。所以 tag message 走
+#       "纯文本 + 仅保留可读信息" 路线, 不写 markdown 标记和超链接。
 USE_EMOJI = os.environ.get("USE_EMOJI", "1") == "1"
 TAG_LIMIT = int(os.environ.get("TAG_LIMIT", "12"))
 
@@ -206,33 +205,33 @@ total_kept = sum(len(v) for v in buckets.values())
 total_raw  = len(all_short_hashes)
 non_empty_cats = [c for c, v in buckets.items() if v]
 
+# 纯文本格式: 终端阅读友好, 用空行 + 缩进分块, 不依赖 markdown 渲染
 tag_lines = [
-    f"# Release {new_version}",
-    "",
-    f"- **Date**: {today}",
-    f"- **Range**: {prev_label} → {new_version}",
-    f"- **Commits**: {total_kept} kept / {total_raw} total"
-    + (f"  ·  Categories: {len(non_empty_cats)}" if non_empty_cats else ""),
+    f"Release {new_version}",
+    f"Date    : {today}",
+    f"Range   : {prev_label} -> {new_version}",
+    f"Commits : {total_kept} kept / {total_raw} total"
+    + (f"  (categories: {len(non_empty_cats)})" if non_empty_cats else ""),
 ]
 if OWNER_REPO and prev_label and prev_label.startswith("v"):
     tag_lines.append(
-        f"- **Compare**: [{prev_label}...{new_version}]"
-        f"(https://github.com/{OWNER_REPO}/compare/{prev_label}...{new_version})"
+        f"Compare : https://github.com/{OWNER_REPO}/compare/{prev_label}...{new_version}"
     )
-tag_lines += ["", "---", ""]
+tag_lines.append("")
 
 total_in_tag = 0
 overflow = False
 for cat, items in buckets.items():
     if not items:
         continue
-    tag_lines.append(f"## {cat_label(cat)} ({len(items)})")
-    tag_lines.append("")
+    tag_lines.append(f"{cat_label(cat)} ({len(items)})")
     for norm, short, full in items:
         if total_in_tag >= TAG_LIMIT:
             overflow = True
             break
-        tag_lines.append(f"- {linkify_issues(norm)} ({commit_link(short, full)})")
+        # 纯文本: "  - 文案 (短哈希)", 不带 markdown 链接;
+        # linkify_issues 在无 OWNER_REPO 时会原样返回, 此处显式不调用避免插链接
+        tag_lines.append(f"  - {norm} ({short})")
         total_in_tag += 1
     tag_lines.append("")
     if overflow:
@@ -240,13 +239,8 @@ for cat, items in buckets.items():
 
 if overflow:
     remaining = total_kept - total_in_tag
-    tag_lines.append("---")
-    tag_lines.append("")
     tag_lines.append(
-        f"_… +{remaining} more entries — see [`docs/changelog/{new_version}.md`]"
-        f"(https://github.com/{OWNER_REPO}/blob/{new_version}/docs/changelog/{new_version}.md)_"
-        if OWNER_REPO else
-        f"_… +{remaining} more entries — see docs/changelog/{new_version}.md_"
+        f"... +{remaining} more entries -- see docs/changelog/{new_version}.md"
     )
 
 print("MARK_TAG")

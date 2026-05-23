@@ -347,44 +347,164 @@ function update(version) {
   if (version) {
     title = "是否确认更新到 " + version + " 版本？";
   } else {
-    title = "将从Github拉取最新程序代码并重启，是否确认？";
+    title = "将从 GitHub 拉取最新程序代码并重启，是否确认？";
   }
   show_confirm_modal(title, function () {
     hide_confirm_modal();
-    show_wait_modal(true);
 
-    // 客户端兜底超时：3 分钟。后端正常成功会触发 back_to_login_page（9s 内自动跳转登录页）；
-    // 后端正常失败会进入 ret.code===1 分支弹错误。
-    // 但群晖/裸机场景下 restart 可能让 web 进程被杀，请求永远等不到响应，
-    // 这时靠这里的 client timeout 兜底，不再无限转圈。
-    let updateDone = false;
-    const updateTimeoutTimer = setTimeout(function () {
-      if (updateDone) return;
-      updateDone = true;
-      hide_wait_modal();
-      show_fail_modal(
-        "更新等待超时（3 分钟）。可能服务正在重启或后台仍在执行，" +
-        "请稍后刷新页面查看版本号。如果版本未变，请到 系统设置 → 实时日志 搜索 [Update] 查看详情。"
-      );
-    }, 180000);
-
-    // 后端成功才会重启进程, 失败时返回 {code:1, msg:...} 让前端能感知
+    // 触发后台异步更新（立即返回），然后展示进度面板用 SSE 推进度
     ajax_post("update_system", {}, function (ret) {
-      if (updateDone) return;
-      updateDone = true;
-      clearTimeout(updateTimeoutTimer);
-      if (ret && ret.code === 0) {
-        // 成功路径: 后端马上会 restart_server, 进程会断, 等待重启完成后回登录页
-        back_to_login_page("update_system");
+      if (ret && (ret.code === 0 || ret.async || ret.already_running)) {
+        show_update_progress_modal();
       } else {
-        // 失败路径: 关掉等待框, 弹错误信息, **不要登出**, 这样用户能继续看实时日志排查
-        hide_wait_modal();
-        const msg = (ret && ret.msg) ? ret.msg : "更新失败，请到 系统设置 → 实时日志 查看 [Update] 关键字";
-        show_fail_modal("更新失败：" + msg);
+        const msg = (ret && ret.msg) ? ret.msg : "更新启动失败";
+        show_fail_modal("更新启动失败：" + msg);
       }
     }, true, false);
   });
 }
+
+// 全局 EventSource 引用，用于关闭面板时清理
+let UpdateES = undefined;
+
+// 展示更新进度面板：百分比 + 阶段 + 滚动日志，由 /stream-update SSE 驱动
+function show_update_progress_modal() {
+  // 关闭可能残留的等待框
+  hide_wait_modal();
+  // 已存在则不重复创建
+  if (!document.getElementById("modal-update-progress")) {
+    const html = '' +
+      '<div class="modal modal-blur fade" id="modal-update-progress" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false" role="dialog" aria-hidden="true">' +
+      '  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">' +
+      '    <div class="modal-content">' +
+      '      <div class="modal-header">' +
+      '        <h5 class="modal-title">正在更新 NasTools</h5>' +
+      '      </div>' +
+      '      <div class="modal-body">' +
+      '        <div class="d-flex justify-content-between mb-1">' +
+      '          <span id="update-phase-text" class="text-muted">等待开始...</span>' +
+      '          <span id="update-percent-text" class="text-muted">0%</span>' +
+      '        </div>' +
+      '        <div class="progress mb-3" style="height:14px;">' +
+      '          <div id="update-progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%"></div>' +
+      '        </div>' +
+      '        <div id="update-message" class="small text-secondary mb-2">&nbsp;</div>' +
+      '        <details open>' +
+      '          <summary class="text-muted small mb-2">实时日志</summary>' +
+      '          <pre id="update-log-pane" style="max-height:280px;overflow:auto;background:#0d1117;color:#c9d1d9;font-size:12px;padding:10px;border-radius:6px;margin:0;white-space:pre-wrap;"></pre>' +
+      '        </details>' +
+      '      </div>' +
+      '      <div class="modal-footer">' +
+      '        <button type="button" class="btn btn-link link-secondary" id="update-close-btn" disabled>关闭</button>' +
+      '      </div>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>';
+    document.body.insertAdjacentHTML("beforeend", html);
+    document.getElementById("update-close-btn").addEventListener("click", function () {
+      hide_update_progress_modal();
+    });
+  }
+  const el = document.getElementById("modal-update-progress");
+  const inst = bootstrap.Modal.getOrCreateInstance(el);
+  inst.show();
+
+  // 复位 UI
+  set_update_progress_ui({phase: "preflight", percent: 1, message: "准备更新...", log_tail: []});
+
+  // 建立 SSE
+  if (UpdateES) {
+    try { UpdateES.close(); } catch (_) {}
+  }
+  UpdateES = new EventSource("/stream-update");
+  UpdateES.onmessage = function (ev) {
+    let payload;
+    try { payload = JSON.parse(ev.data); } catch (_) { return; }
+    const data = (payload && payload.data) || {};
+    set_update_progress_ui(data);
+    if (data.done) {
+      try { UpdateES.close(); } catch (_) {}
+      UpdateES = undefined;
+      const closeBtn = document.getElementById("update-close-btn");
+      if (closeBtn) closeBtn.disabled = false;
+      if (data.success) {
+        // 成功：服务即将重启，等几秒后回登录页
+        setTimeout(function () {
+          back_to_login_page("update_system");
+        }, 3000);
+      }
+    }
+  };
+  UpdateES.onerror = function () {
+    // 连接断开：通常是 restart 把 web 进程杀了，属于成功路径的尾声，
+    // 不主动报错，让客户端兜底超时跳登录
+  };
+}
+
+function hide_update_progress_modal() {
+  const el = document.getElementById("modal-update-progress");
+  if (el) {
+    const inst = bootstrap.Modal.getInstance(el);
+    if (inst) inst.hide();
+  }
+  if (UpdateES) {
+    try { UpdateES.close(); } catch (_) {}
+    UpdateES = undefined;
+  }
+}
+
+// 阶段中文标签
+const UPDATE_PHASE_LABEL = {
+  idle: "等待开始",
+  preflight: "环境检查",
+  fetching: "拉取代码",
+  resetting: "切换版本",
+  installing: "安装依赖",
+  restarting: "重启服务",
+  done: "更新成功",
+  failed: "更新失败",
+};
+
+function set_update_progress_ui(data) {
+  if (!data) return;
+  const phase = data.phase || "idle";
+  const percent = Math.max(0, Math.min(100, data.percent || 0));
+  const message = data.message || "";
+  const logTail = data.log_tail || [];
+
+  const phaseText = document.getElementById("update-phase-text");
+  const percentText = document.getElementById("update-percent-text");
+  const bar = document.getElementById("update-progress-bar");
+  const msgEl = document.getElementById("update-message");
+  const logEl = document.getElementById("update-log-pane");
+
+  if (phaseText) {
+    let label = UPDATE_PHASE_LABEL[phase] || phase;
+    if (data.target_ref) {
+      label += "（目标：" + data.target_ref + "）";
+    }
+    phaseText.textContent = label;
+  }
+  if (percentText) percentText.textContent = percent + "%";
+  if (bar) {
+    bar.style.width = percent + "%";
+    bar.classList.remove("bg-success", "bg-danger");
+    if (phase === "done" && data.success) {
+      bar.classList.add("bg-success");
+      bar.classList.remove("progress-bar-animated");
+    } else if (phase === "failed") {
+      bar.classList.add("bg-danger");
+      bar.classList.remove("progress-bar-animated");
+    }
+  }
+  if (msgEl) msgEl.textContent = message || "\u00A0";
+  if (logEl) {
+    logEl.textContent = logTail.join("\n");
+    // 自动滚到底
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
 
 // 显示配置不完整提示
 function show_init_alert_modal() {

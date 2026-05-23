@@ -5,6 +5,16 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# setuptools 版本守门员: 启动最早期自检, 防止上游套件钩子把 setuptools 推到 70+/81+ 后
+# fast-bencode / supervisor / pkg_resources 链式雪崩. 不阻塞启动, 只打印告警 + 设置 env flag,
+# WebUI 可根据 NT_SETUPTOOLS_DEGRADED 环境变量在设置页飘 banner. 详见 app/helper/setuptools_guard.py
+try:
+    from app.helper.setuptools_guard import check as _setuptools_check
+    _setuptools_check()
+except Exception:
+    # 守门员自身不能炸主进程
+    pass
+
 # 运行环境判断
 is_executable = getattr(sys, 'frozen', False)
 is_windows_exe = is_executable and (os.name == "nt")

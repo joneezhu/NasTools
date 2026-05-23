@@ -1,3 +1,11 @@
+# ===== build toolchain (must be pinned, do NOT relax) =====
+# fast-bencode==1.1.3 (上古 sdist) 强约束 setuptools<70: setuptools 70+ 删了 distutils.parse_command_line
+# supervisor 仍依赖 pkg_resources: setuptools 81+ 移除该模块, 套件起不来 (踩坑详见 .workbuddy/memory)
+# pip 25+ 开始 deprecate 老 API, 对 sdist 不友好, 一并钉上限
+# 这两行必须在所有依赖之前, pip 装包时会强制锁定, 任何 init 钩子误升都会被 pip resolver 卡住
+pip<25
+setuptools<70
+# ==========================================================
 alembic==1.11.2
 aniso8601==9.0.1
 anitopy==2.1.1

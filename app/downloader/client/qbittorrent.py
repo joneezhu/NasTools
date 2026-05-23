@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import time
@@ -480,6 +481,9 @@ class Qbittorrent(_IDownloadClient):
             if is_auto and not category:
                 category = self.__check_category(save_path)
 
+            # 提前算 hash（用作权威反查依据，命中即可秒判定“种子已存在”，且无需依赖临时 tag）
+            info_hash = self.compute_torrent_hash(content)
+
             # 添加下载
             qbc_ret = self.qbc.torrents_add(urls=urls,
                                             torrent_files=torrent_files,
@@ -497,10 +501,10 @@ class Qbittorrent(_IDownloadClient):
             if qbc_ret and str(qbc_ret).find("Ok") != -1:
                 return True
             # qb 返回非 Ok（含 "Fails."），说明被服务端拒绝；尝试事后比对，可能是种子已存在
-            if self.__exists_in_qb(urls=urls, tag=tags):
+            if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):
                 log.warn(
                     f"【{self.client_name}】{self.name} 种子已存在于下载器中（torrents_add 返回 {qbc_ret}），"
-                    f"视为添加成功 | save_path={save_path}, tags={tags}"
+                    f"视为添加成功 | save_path={save_path}, info_hash={info_hash}"
                 )
                 return True
             log.error(
@@ -510,10 +514,10 @@ class Qbittorrent(_IDownloadClient):
             return False
         except qbittorrentapi.Conflict409Error as err:
             # 409 Conflict 常见原因：种子已存在 / 分类校验失败等。先做事后比对再判定。
-            if self.__exists_in_qb(urls=urls, tag=tags):
+            if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):
                 log.warn(
                     f"【{self.client_name}】{self.name} 种子已存在于下载器中（Conflict409），"
-                    f"视为添加成功 | save_path={save_path}, tags={tags}"
+                    f"视为添加成功 | save_path={save_path}, info_hash={info_hash}"
                 )
                 return True
             log.error(
@@ -525,10 +529,10 @@ class Qbittorrent(_IDownloadClient):
         except Exception as err:
             # 其它异常：仍尝试事后比对，避免网络抖动等导致状态不同步
             try:
-                if self.__exists_in_qb(urls=urls, tag=tags):
+                if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):
                     log.warn(
                         f"【{self.client_name}】{self.name} 添加种子异常但事后比对发现种子已存在，视为成功："
-                        f"{type(err).__name__}: {str(err) or '无详细信息'} | tags={tags}"
+                        f"{type(err).__name__}: {str(err) or '无详细信息'} | info_hash={info_hash}"
                     )
                     return True
             except Exception:
@@ -540,18 +544,26 @@ class Qbittorrent(_IDownloadClient):
             )
             return False
 
-    def __exists_in_qb(self, urls=None, tag=None):
+    def __exists_in_qb(self, urls=None, tag=None, info_hash=None):
         """
         事后比对：判断刚才尝试添加的种子是否其实已经在下载器中。
-        优先用 tag 反查（NasTools 添加种子时通常会带唯一 tag），其次再退化到按 url 解析 hash。
+        优先级：info_hash（最准、命中率 100%）→ tag → url 中携带的 hash。
         :param urls: 添加时使用的 url（字符串或 list/tuple，可能为 None）
         :param tag: 添加时使用的 tag（字符串或 list/tuple，可能为 None）
+        :param info_hash: 提前算好的 v1 infohash（小写 40 位 hex，可选）
         :return: bool
         """
         if not self.qbc:
             return False
-        # 1) 通过 tag 反查（最稳：NasTools 在 add_torrent 阶段会传入唯一 tag，
-        #    若 qb 已存在同 hash 种子，新打的 tag 会被合并到既有种子上）
+        # 1) 通过 info_hash 直接反查（最权威）
+        try:
+            if info_hash:
+                torrents, err = self.get_torrents(ids=info_hash.lower())
+                if not err and torrents:
+                    return True
+        except Exception as e:
+            log.debug(f"【{self.client_name}】{self.name} 按 info_hash 反查种子异常：{str(e)}")
+        # 2) 通过 tag 反查（兜底：极少数 hash 解析失败的场景）
         try:
             if tag:
                 tag_list = tag if isinstance(tag, (list, tuple)) else [tag]
@@ -565,7 +577,7 @@ class Qbittorrent(_IDownloadClient):
                         return True
         except Exception as e:
             log.debug(f"【{self.client_name}】{self.name} 按 tag 反查种子异常：{str(e)}")
-        # 2) 通过 url 中可能携带的 infohash 反查（兜底，多数 PT 站 url 不含 hash，因此命中率有限）
+        # 3) 通过 url 中可能携带的 infohash 反查（最后兜底，多数 PT 站 url 不含 hash）
         try:
             if urls:
                 url_list = urls if isinstance(urls, (list, tuple)) else [urls]
@@ -575,8 +587,8 @@ class Qbittorrent(_IDownloadClient):
                     m = re.search(r"([0-9a-fA-F]{40})", str(u))
                     if not m:
                         continue
-                    info_hash = m.group(1).lower()
-                    torrents, err = self.get_torrents(ids=info_hash)
+                    h = m.group(1).lower()
+                    torrents, err = self.get_torrents(ids=h)
                     if err:
                         continue
                     if torrents:
@@ -584,6 +596,83 @@ class Qbittorrent(_IDownloadClient):
         except Exception as e:
             log.debug(f"【{self.client_name}】{self.name} 按 hash 反查种子异常：{str(e)}")
         return False
+
+    @staticmethod
+    def compute_torrent_hash(content):
+        """
+        从 .torrent 二进制 / magnet / 含 btih 的 url 中计算/提取 v1 infohash（小写 40 位 hex）。
+        :param content: bytes / str / list / tuple，与 add_torrent 的 content 同形态
+        :return: 40 位小写 hex 字符串；失败返回 None
+        """
+        if not content:
+            return None
+        try:
+            # bytes：标准 .torrent 文件
+            if isinstance(content, (bytes, bytearray)):
+                try:
+                    from bencode import bdecode, bencode  # type: ignore
+                    data = bdecode(bytes(content))
+                    if isinstance(data, dict) and b"info" in data:
+                        return hashlib.sha1(bencode(data[b"info"])).hexdigest().lower()
+                    if isinstance(data, dict) and "info" in data:
+                        return hashlib.sha1(bencode(data["info"])).hexdigest().lower()
+                except Exception:
+                    return None
+                return None
+            # 字符串：magnet 或 http(s) url，仅尝试从 url 文本中抽 hash
+            if isinstance(content, str):
+                # magnet:?xt=urn:btih:HEX 或 url 中含 40 位 hex
+                m = re.search(r"urn:btih:([0-9a-fA-F]{40})", content)
+                if m:
+                    return m.group(1).lower()
+                # base32 形式（32 位字符），转成 hex
+                m32 = re.search(r"urn:btih:([A-Z2-7]{32})", content)
+                if m32:
+                    try:
+                        import base64
+                        return base64.b32decode(m32.group(1)).hex().lower()
+                    except Exception:
+                        pass
+                m = re.search(r"([0-9a-fA-F]{40})", content)
+                if m:
+                    return m.group(1).lower()
+                return None
+            # list/tuple：取第一个能解出来的
+            if isinstance(content, (list, tuple)):
+                for c in content:
+                    h = Qbittorrent.compute_torrent_hash(c)
+                    if h:
+                        return h
+                return None
+        except Exception as err:
+            log.debug(f"【qbittorrent】compute_torrent_hash 异常：{str(err)}")
+        return None
+
+    def get_torrent_id_by_hash(self, info_hash, max_wait=10):
+        """
+        通过 info_hash 反查种子 ID（即 hash 本身）。立即查一次，不命中再短轮询兜底（1s/次）。
+        :param info_hash: 40 位小写 hex
+        :param max_wait: 最大等待秒数（短轮询兜底）
+        :return: 种子 hash 或 None
+        """
+        if not info_hash or not self.qbc:
+            return None
+        info_hash = info_hash.lower()
+        try:
+            torrents, err = self.get_torrents(ids=info_hash)
+            if not err and torrents:
+                return info_hash
+        except Exception as e:
+            log.debug(f"【{self.client_name}】{self.name} get_torrent_id_by_hash 立即查异常：{str(e)}")
+        for _ in range(max(0, int(max_wait))):
+            time.sleep(1)
+            try:
+                torrents, err = self.get_torrents(ids=info_hash)
+                if not err and torrents:
+                    return info_hash
+            except Exception:
+                continue
+        return None
 
     def start_torrents(self, ids):
         if not self.qbc:
