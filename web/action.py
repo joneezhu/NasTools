@@ -127,6 +127,7 @@ class WebAction:
             "check_site_attr": self.__check_site_attr,
             "refresh_process": self.refresh_process,
             "restory_backup": self.__restory_backup,
+            "inspect_backup": self.__inspect_backup,
             "start_mediasync": self.__start_mediasync,
             "start_mediaDisplayModuleSync": self.__start_mediaDisplayModuleSync,
             "mediasync_state": self.__mediasync_state,
@@ -2821,23 +2822,237 @@ class WebAction:
     def __restory_backup(data):
         """
         解压恢复备份文件
+        支持两种模式：
+        - replace（默认）：整库覆盖（config.yaml + default-category.yaml + user.db），
+          适合同分支同版本的本机迁移。
+        - merge：智能合并，只导入业务数据表（保留本机 schema 与 alembic_version），
+          适合从其他分支/版本的 NasTools 备份导入；本机启动时会自动 alembic upgrade。
+        可选：restore_config=True 时同时覆盖 config.yaml / default-category.yaml；
+              restore_config=False 时仅恢复数据库（merge 默认 False，replace 默认 True）。
         """
         filename = data.get("file_name")
-        if filename:
-            config_path = Config().get_config_path()
-            temp_path = Config().get_temp_path()
-            file_path = os.path.join(temp_path, filename)
-            try:
-                shutil.unpack_archive(file_path, config_path, format='zip')
-                return {"code": 0, "msg": ""}
-            except Exception as e:
-                ExceptionUtils.exception_traceback(e)
-                return {"code": 1, "msg": str(e)}
-            finally:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+        mode = (data.get("mode") or "replace").lower()
+        # merge 模式默认仅恢复数据库；replace 默认连配置一起恢复
+        restore_config = data.get("restore_config")
+        if restore_config is None:
+            restore_config = (mode == "replace")
 
-        return {"code": 1, "msg": "文件不存在"}
+        if not filename:
+            return {"code": 1, "msg": "文件不存在"}
+
+        config_path = Config().get_config_path()
+        temp_path = Config().get_temp_path()
+        file_path = os.path.join(temp_path, filename)
+        if not os.path.exists(file_path):
+            return {"code": 1, "msg": "文件不存在"}
+
+        # 解压到临时目录，便于读取 metadata + 选择性恢复
+        extract_dir = os.path.join(temp_path, f"restore_{int(time.time())}")
+        try:
+            os.makedirs(extract_dir, exist_ok=True)
+            shutil.unpack_archive(file_path, extract_dir, format='zip')
+
+            src_db = os.path.join(extract_dir, "user.db")
+            if not os.path.exists(src_db):
+                return {"code": 1, "msg": "备份文件无效：缺少 user.db"}
+
+            # 在覆盖前先把当前关键文件做一份回滚备份
+            rollback_dir = os.path.join(config_path, "backup_file",
+                                        f"rollback_{time.strftime('%Y%m%d%H%M%S')}")
+            os.makedirs(rollback_dir, exist_ok=True)
+            for fn in ("config.yaml", "default-category.yaml", "user.db"):
+                fp = os.path.join(config_path, fn)
+                if os.path.exists(fp):
+                    shutil.copy(fp, rollback_dir)
+
+            try:
+                if mode == "merge":
+                    # 智能合并：保留本机 user.db 的 schema 与 alembic_version
+                    summary = WebAction.__merge_user_db(
+                        src_db=src_db,
+                        dst_db=os.path.join(config_path, "user.db")
+                    )
+                    if restore_config:
+                        for fn in ("config.yaml", "default-category.yaml"):
+                            sp = os.path.join(extract_dir, fn)
+                            if os.path.exists(sp):
+                                shutil.copy(sp, config_path)
+                    msg = f"已合并 {summary['tables']} 张表 / {summary['rows']} 行数据，本机表结构与版本保持不变。回滚备份：{rollback_dir}"
+                    return {"code": 0, "msg": msg, "mode": "merge", "summary": summary, "rollback": rollback_dir}
+                else:
+                    # 整库覆盖
+                    shutil.copy(src_db, os.path.join(config_path, "user.db"))
+                    if restore_config:
+                        for fn in ("config.yaml", "default-category.yaml"):
+                            sp = os.path.join(extract_dir, fn)
+                            if os.path.exists(sp):
+                                shutil.copy(sp, config_path)
+                    return {"code": 0, "msg": f"已整库覆盖恢复，回滚备份：{rollback_dir}",
+                            "mode": "replace", "rollback": rollback_dir}
+            except Exception as inner:
+                # 任何失败 → 自动回滚
+                ExceptionUtils.exception_traceback(inner)
+                for fn in ("config.yaml", "default-category.yaml", "user.db"):
+                    rb = os.path.join(rollback_dir, fn)
+                    if os.path.exists(rb):
+                        shutil.copy(rb, config_path)
+                return {"code": 1, "msg": f"恢复失败已回滚：{inner}"}
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {"code": 1, "msg": str(e)}
+        finally:
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    @staticmethod
+    def __inspect_backup(data):
+        """
+        预览备份文件信息（在确认恢复前，给用户看清楚来源版本/表数量/记录数）
+        """
+        filename = data.get("file_name")
+        if not filename:
+            return {"code": 1, "msg": "文件不存在"}
+        temp_path = Config().get_temp_path()
+        file_path = os.path.join(temp_path, filename)
+        if not os.path.exists(file_path):
+            return {"code": 1, "msg": "文件不存在"}
+
+        extract_dir = os.path.join(temp_path, f"inspect_{int(time.time())}")
+        try:
+            os.makedirs(extract_dir, exist_ok=True)
+            shutil.unpack_archive(file_path, extract_dir, format='zip')
+            info = {
+                "has_config": os.path.exists(os.path.join(extract_dir, "config.yaml")),
+                "has_category": os.path.exists(os.path.join(extract_dir, "default-category.yaml")),
+                "has_db": os.path.exists(os.path.join(extract_dir, "user.db")),
+                "metadata": None,
+                "tables": [],
+                "current_version": None,
+            }
+            meta_path = os.path.join(extract_dir, "backup_meta.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as fp:
+                        info["metadata"] = json.load(fp)
+                except Exception:
+                    pass
+
+            # 读 user.db 表 + 行数 + alembic 版本
+            src_db = os.path.join(extract_dir, "user.db")
+            if os.path.exists(src_db):
+                conn = sqlite3.connect(src_db)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                    tables = [r[0] for r in cur.fetchall() if not r[0].startswith("sqlite_")]
+                    rows_per_table = []
+                    for t in tables:
+                        try:
+                            cur.execute(f"SELECT COUNT(*) FROM \"{t}\"")
+                            cnt = cur.fetchone()[0]
+                        except Exception:
+                            cnt = -1
+                        rows_per_table.append({"name": t, "rows": cnt})
+                    info["tables"] = rows_per_table
+                    try:
+                        cur.execute("SELECT version_num FROM alembic_version LIMIT 1")
+                        row = cur.fetchone()
+                        info["alembic_version"] = row[0] if row else None
+                    except Exception:
+                        info["alembic_version"] = None
+                finally:
+                    conn.close()
+
+            # 当前本机版本，便于前端比对
+            try:
+                from version import APP_VERSION
+                info["current_version"] = APP_VERSION
+            except Exception:
+                info["current_version"] = None
+            try:
+                conn = sqlite3.connect(os.path.join(Config().get_config_path(), "user.db"))
+                cur = conn.cursor()
+                cur.execute("SELECT version_num FROM alembic_version LIMIT 1")
+                row = cur.fetchone()
+                info["current_alembic_version"] = row[0] if row else None
+                conn.close()
+            except Exception:
+                info["current_alembic_version"] = None
+
+            return {"code": 0, "info": info}
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {"code": 1, "msg": str(e)}
+        finally:
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+    @staticmethod
+    def __merge_user_db(src_db, dst_db):
+        """
+        将外部 user.db 中存在于本机 schema 的业务数据表合并到 dst_db。
+        - 保留 dst_db 的全部 schema、索引、alembic_version
+        - 对每张匹配的表：取双方列名交集，DELETE FROM 后 INSERT 外部数据
+        - alembic_version、sqlite_* 系统表跳过
+        - 列结构不一致时，仅同步交集列（以本机为准），缺失列用默认值/NULL
+        """
+        skip_tables = {"alembic_version"}
+
+        src = sqlite3.connect(src_db)
+        dst = sqlite3.connect(dst_db)
+        try:
+            src_cur = src.cursor()
+            dst_cur = dst.cursor()
+
+            def list_tables(cur):
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                return [r[0] for r in cur.fetchall() if not r[0].startswith("sqlite_")]
+
+            def list_cols(cur, table):
+                cur.execute(f"PRAGMA table_info(\"{table}\")")
+                return [r[1] for r in cur.fetchall()]
+
+            src_tables = set(list_tables(src_cur))
+            dst_tables = set(list_tables(dst_cur))
+            common_tables = (src_tables & dst_tables) - skip_tables
+
+            total_tables = 0
+            total_rows = 0
+            details = []
+            dst.execute("BEGIN")
+            for t in sorted(common_tables):
+                src_cols = list_cols(src_cur, t)
+                dst_cols = list_cols(dst_cur, t)
+                col_intersect = [c for c in dst_cols if c in src_cols]
+                if not col_intersect:
+                    continue
+                col_quoted = ",".join([f'"{c}"' for c in col_intersect])
+                src_cur.execute(f"SELECT {col_quoted} FROM \"{t}\"")
+                rows = src_cur.fetchall()
+                # 清空目标表后插入；避免主键冲突 / 旧数据混淆
+                try:
+                    dst_cur.execute(f"DELETE FROM \"{t}\"")
+                except Exception:
+                    continue
+                if rows:
+                    placeholders = ",".join(["?"] * len(col_intersect))
+                    sql = f"INSERT INTO \"{t}\" ({col_quoted}) VALUES ({placeholders})"
+                    try:
+                        dst_cur.executemany(sql, rows)
+                    except Exception as e:
+                        log.warn(f"【Backup】合并表 {t} 失败：{e}")
+                        details.append({"table": t, "rows": 0, "error": str(e)})
+                        continue
+                total_tables += 1
+                total_rows += len(rows)
+                details.append({"table": t, "rows": len(rows)})
+            dst.commit()
+            return {"tables": total_tables, "rows": total_rows, "details": details}
+        finally:
+            src.close()
+            dst.close()
 
     @staticmethod
     def __get_resume(data):
@@ -5550,6 +5765,32 @@ class WebAction:
                 conn.commit()
                 cursor.close()
                 conn.close()
+
+            # 写入备份元数据，便于跨分支恢复时显示来源
+            try:
+                from version import APP_VERSION
+            except Exception:
+                APP_VERSION = "unknown"
+            alembic_version = None
+            try:
+                conn = sqlite3.connect(f'{backup_path}/user.db')
+                cur = conn.cursor()
+                cur.execute("SELECT version_num FROM alembic_version LIMIT 1")
+                row = cur.fetchone()
+                alembic_version = row[0] if row else None
+                conn.close()
+            except Exception:
+                pass
+            meta = {
+                "app_version": APP_VERSION,
+                "alembic_version": alembic_version,
+                "full_backup": bool(full_backup),
+                "created_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "schema_format": "nastools-backup-v1",
+            }
+            with open(f"{backup_path}/backup_meta.json", "w", encoding="utf-8") as fp:
+                json.dump(meta, fp, ensure_ascii=False, indent=2)
+
             zip_file = str(backup_path) + '.zip'
             if os.path.exists(zip_file):
                 zip_file = str(backup_path) + '.zip'
