@@ -128,8 +128,93 @@ CUR_VERSION="$(grep -E "^APP_VERSION" "$VERSION_FILE" | sed -E "s/.*'(v[^']+)'.*
 log "当前版本: $CUR_VERSION  ->  目标版本: $NEW_VERSION"
 log "Changelog 范围: $RANGE_LABEL  ->  HEAD"
 
-[[ "$CUR_VERSION" == "$NEW_VERSION" ]] && die "目标版本与当前版本相同"
-git rev-parse "$NEW_VERSION" >/dev/null 2>&1 && die "tag $NEW_VERSION 已存在"
+# ---------- 已有 tag / Release 状态判定 ----------
+# 三种情况:
+#   A) tag 不存在               -> 走完整流程 (生成 changelog / commit / tag / push / 触发构建)
+#   B) tag 已存在 + Release 有安装包 -> 直接退出, 无事可做
+#   C) tag 已存在 + Release 无安装包 -> 跳过 commit/tag/push, 仅触发 build-package.yml 重新出包
+#
+# 安装包存在性: 当对应 tag 的 GitHub Release 存在且至少有 1 个 asset 视为已发布。
+TAG_EXISTS=false
+PACKAGE_EXISTS=false
+SKIP_COMMIT_TAG=false
+ONLY_REBUILD_PACKAGE=false
+
+# 本地或远端任一存在即视为 tag 已存在
+if git rev-parse "$NEW_VERSION" >/dev/null 2>&1; then
+  TAG_EXISTS=true
+elif git ls-remote --tags --exit-code origin "refs/tags/$NEW_VERSION" >/dev/null 2>&1; then
+  TAG_EXISTS=true
+fi
+
+if $TAG_EXISTS; then
+  log "检测到 tag $NEW_VERSION 已存在, 检查 Release 安装包状态..."
+  if command -v gh >/dev/null 2>&1; then
+    # 先确认 gh 认证状态, 未认证时直接拒绝判定 (避免把"无权限"误判成"无安装包"导致重复发布)
+    if ! gh auth status >/dev/null 2>&1; then
+      die "tag $NEW_VERSION 已存在, 但 gh CLI 未登录, 无法判断 Release 是否已有安装包。
+      请先执行: gh auth login   (或在 .release 中配置 GH_TOKEN=\$RELEASE_GH_TOKEN)"
+    fi
+    # 临时关闭 errexit, gh release view 在 Release 不存在时会 exit 1
+    set +e
+    gh_release_json="$(gh release view "$NEW_VERSION" --json assets,tagName 2>/dev/null)"
+    gh_rc=$?
+    set -e
+    if [[ $gh_rc -eq 0 && -n "$gh_release_json" ]]; then
+      asset_count="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(len(d.get('assets', [])))" "$gh_release_json" 2>/dev/null || echo 0)"
+      if [[ "$asset_count" -gt 0 ]]; then
+        PACKAGE_EXISTS=true
+      fi
+      log "Release 状态: tag=$NEW_VERSION, assets=$asset_count"
+    else
+      log "未找到 $NEW_VERSION 的 GitHub Release"
+    fi
+  else
+    die "tag $NEW_VERSION 已存在, 但未安装 gh CLI, 无法判断 Release 是否已有安装包。
+      请先安装: brew install gh, 然后 gh auth login"
+  fi
+
+  if $PACKAGE_EXISTS; then
+    ok "tag $NEW_VERSION 已存在且 Release 已包含安装包 ($asset_count 个), 无需重复发布"
+    echo "    Release: https://github.com/$(git config --get remote.origin.url \
+                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases/tag/$NEW_VERSION"
+    exit 0
+  fi
+
+  warn "tag $NEW_VERSION 已存在但 Release 缺少安装包, 将仅重跑 build-package.yml"
+  SKIP_COMMIT_TAG=true
+  ONLY_REBUILD_PACKAGE=true
+else
+  [[ "$CUR_VERSION" == "$NEW_VERSION" ]] && die "目标版本与当前版本相同 (且未打 tag), 请先确认 version.py"
+fi
+
+# ---------- 仅重跑打包流水线模式 ----------
+if $ONLY_REBUILD_PACKAGE; then
+  if $DRY_RUN; then
+    warn "--dry-run, 仅重跑安装包模式: 不会实际触发 build-package.yml"
+    log "(本应触发) gh workflow run build-package.yml --ref $NEW_VERSION"
+    exit 0
+  fi
+  if $NO_BUILD; then
+    warn "--no-build, 跳过 build-package.yml 触发"
+    exit 0
+  fi
+  : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN}"
+
+  log "通过 gh 触发 build-package.yml (基于已有 tag $NEW_VERSION 重新出包)..."
+  # 用 tag 作为 ref, 流水线里读到的 version.py 就是该 tag 上的版本
+  gh workflow run build-package.yml --ref "$NEW_VERSION" \
+    -f github_token="$RELEASE_GH_TOKEN"
+  ok "build-package.yml 已派发 (ref=$NEW_VERSION)"
+  echo
+  echo "    Actions  : https://github.com/$(git config --get remote.origin.url \
+                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/actions/workflows/build-package.yml"
+  echo "    Releases : https://github.com/$(git config --get remote.origin.url \
+                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases"
+  echo
+  ok "已为已有 tag $NEW_VERSION 重跑安装包流水线 ✅"
+  exit 0
+fi
 
 # ---------- 收集 / 清洗 commit ----------
 log "收集 commit 并清洗..."

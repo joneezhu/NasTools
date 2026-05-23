@@ -103,6 +103,117 @@ nastool_<platform>_v<version>[.exe]
 
 绝大多数发布无需手动执行下述七个步骤，使用 `scripts/release.sh` 即可一站式完成 **CHANGELOG 生成 + 版本号修改 + 打 Tag + 推送 + 触发构建**。
 
+#### 前置依赖：安装 gh CLI
+
+`scripts/release.sh` 通过 GitHub 官方 [`gh` CLI](https://cli.github.com/) 完成两件事：
+
+1. 触发 `build.yml` / `build-beta.yml` / `build-package.yml` 三条 GitHub Actions 流水线
+2. 调用 `gh release view` 判断目标 tag 是否已发布安装包（幂等行为依赖此能力）
+
+未安装 `gh` 时脚本会拒绝执行，请按所在平台安装：
+
+##### macOS
+
+```bash
+# 方式 1（推荐）: Homebrew
+brew install gh
+
+# 方式 2: 官方 pkg 安装包
+# 到 https://github.com/cli/cli/releases/latest 下载对应架构 (arm64 / amd64) 的 .pkg
+sudo installer -pkg ~/Downloads/gh_*_macOS_*.pkg -target /
+```
+
+##### Windows
+
+```powershell
+# 方式 1（推荐）: winget
+winget install --id GitHub.cli
+
+# 方式 2: Scoop
+scoop install gh
+
+# 方式 3: Chocolatey
+choco install gh
+
+# 方式 4: 官方 MSI 安装包
+# 到 https://github.com/cli/cli/releases/latest 下载 gh_*_windows_amd64.msi 双击安装
+```
+
+> 安装后需重启终端（PowerShell / CMD / Windows Terminal）以让 PATH 生效。
+
+##### Linux
+
+```bash
+# Debian / Ubuntu
+sudo apt install gh
+
+# 如果仓库版本太旧, 用官方 apt 源
+type -p curl >/dev/null || sudo apt install curl -y
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+sudo apt update && sudo apt install gh -y
+
+# Fedora / RHEL / CentOS
+sudo dnf install gh
+
+# Arch / Manjaro
+sudo pacman -S github-cli
+```
+
+##### 验证安装
+
+```bash
+gh --version
+# 期望输出: gh version 2.x.x ...
+```
+
+#### 前置依赖：gh CLI 登录授权
+
+安装好之后必须登录，否则 `gh release view` / `gh workflow run` 都会被拒绝。两种方式任选其一：
+
+##### 方式 A：交互式登录（推荐日常使用）
+
+```bash
+gh auth login
+# 选 GitHub.com → HTTPS → Login with a web browser
+# 浏览器自动打开授权, 完成后回到终端
+```
+
+##### 方式 B：用 `.release` 中的 RELEASE_GH_TOKEN 静默登录（推荐 CI / 多账号）
+
+在 `.release` 中追加一行（让 `gh` 自动读环境变量、完全无交互）：
+
+```bash
+# .release
+DOCKER_USERNAME=joneechu
+DOCKER_PASSWORD=dckr_pat_xxx
+RELEASE_GH_TOKEN=github_pat_xxx
+GH_TOKEN=$RELEASE_GH_TOKEN          # 让 gh CLI 自动认证, 无需 gh auth login
+```
+
+或者一次性写入：
+
+```bash
+source .release
+echo "$RELEASE_GH_TOKEN" | gh auth login --with-token
+```
+
+##### 验证登录态
+
+```bash
+gh auth status
+# 期望: ✓ Logged in to github.com as <你的账号> ...
+
+# 进一步验证有触发 workflow 的权限
+gh workflow list -R joneechua/NasTools
+# 应能看到 build.yml / build-beta.yml / build-package.yml
+```
+
+> Token 权限要求：fine-grained PAT 需要 **Contents: Read and write** + **Actions: Read and write**；classic PAT 需要 `repo` + `workflow` scope。详见 token 章节。
+
 #### 首次使用：配置凭据
 
 ```bash
@@ -171,6 +282,20 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 6. 打 annotated tag，tag message 内嵌结构化变更摘要（标题区 + 类目分组 + emoji 图标，默认上限 12 条，可用 `--tag-limit=N` 调整）
 7. push master + tag 到远端
 8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub）与 `build-package.yml`（二进制 + Release）
+
+#### 幂等行为（可重入）
+
+脚本会先检查目标版本号在远端的状态，避免重复发布或漏发安装包：
+
+| 场景 | tag 是否存在 | GitHub Release 安装包 | 行为 |
+|------|------------|----------------------|------|
+| A | ❌ 不存在 | — | 走完整流程（生成 changelog → 改 version → commit → tag → push → 触发三条流水线） |
+| B | ✅ 存在 | ✅ 至少 1 个 asset | 直接退出，提示 Release 链接（无事可做） |
+| C | ✅ 存在 | ❌ 缺失 | 跳过 commit/tag/push，**仅基于已有 tag 重跑 `build-package.yml`** 出包 |
+
+> 场景 C 的典型用例：tag 已打但打包流水线失败/被取消，重跑 `scripts/release.sh vX.Y.Z` 即可补出安装包，不会再生成新的 commit 或 tag。
+>
+> 场景 B/C 都需要本地 **gh CLI 已登录**（脚本会用 `gh release view` 判定 assets 数）。未登录时脚本会拒绝执行，避免误把"无权限"判定成"无安装包"导致重复发版。
 
 ### 4.3 详细步骤（手动备选流程）
 
