@@ -223,8 +223,8 @@ if $ONLY_REBUILD_PACKAGE; then
 
   log "通过 gh 触发 build-package.yml (基于已有 tag $NEW_VERSION 重新出包)..."
   # 用 tag 作为 ref, 流水线里读到的 version.py 就是该 tag 上的版本
-  gh workflow run build-package.yml --ref "$NEW_VERSION" \
-    -f github_token="$RELEASE_GH_TOKEN"
+  # 注意: build-package.yml 不接受任何 inputs (用 secrets.GITHUB_TOKEN 自动鉴权), 因此不要再传 -f github_token=...
+  gh workflow run build-package.yml --ref "$NEW_VERSION"
   ok "build-package.yml 已派发 (ref=$NEW_VERSION)"
   echo
   echo "    Actions  : https://github.com/$(git config --get remote.origin.url \
@@ -548,7 +548,7 @@ if ! $RUN_BUILD; then
   echo "      scripts/release.sh $NEW_VERSION --build"
   echo "    或者直接手动:"
   echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=... -f channel=stable"
-  echo "      gh workflow run build-package.yml --ref $NEW_VERSION -f github_token=..."
+  echo "      gh workflow run build-package.yml --ref $NEW_VERSION"
   echo "    (beta 通道: -f channel=beta; 同时跑稳定+beta: -f channel=both)"
   echo
   ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
@@ -582,8 +582,8 @@ gh workflow run build.yml --ref "$NEW_VERSION" \
   -f channel=stable
 
 log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
-gh workflow run build-package.yml --ref "$NEW_VERSION" \
-  -f github_token="$RELEASE_GH_TOKEN"
+# build-package.yml 不再声明任何 inputs (改用 secrets.GITHUB_TOKEN), 不要传 -f github_token=...
+gh workflow run build-package.yml --ref "$NEW_VERSION"
 
 ok "构建已派发 (ref=$NEW_VERSION), 在 GitHub Actions 页面查看进度"
 echo
