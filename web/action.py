@@ -1284,6 +1284,53 @@ class WebAction:
                 if running != "0":
                     log.warn("【Update】已有更新进程在跑，本次不重复触发")
                     return {"code": 1, "msg": "已有更新进程在执行，请稍后再试"}
+
+                # ===== 预校验目标目录 owner（不自愈，直接给精确指引）=====
+                # 根因：web 进程跑在套件用户（不同套件作者命名不同：NASTool / sc-nastool / nt 等），
+                # git reset --hard 一旦遇到 owner 不是自己的文件
+                # （root 手工 cp、套件 postinst chown 漏勾、submodule pack 文件、DSM 升级遗留）
+                # 立刻 Permission denied，update 半成功 → 启动报 BuiltinIndexerFileMd5 校验失败。
+                #
+                # 设计要点：
+                # 1) 不 hard-code 用户名（nt/sc-nastool/NASTool 都见过），用 `id -un/-gn` 动态探测；
+                # 2) 不再尝试 sudo -n chown 自愈——群晖套件账户默认不在 NOPASSWD sudoers 里，
+                #    99% 跑不通；不如把异常文件列表直接塞回报错，让用户一条 SSH 命令搞定。
+                target_dir = "/var/packages/NASTool/target/nas-tools"
+                _, cur_user, _ = _run("id -un", timeout=5)
+                _, cur_group, _ = _run("id -gn", timeout=5)
+                cur_user = (cur_user or "").strip() or "NASTool"
+                cur_group = (cur_group or "").strip() or cur_user
+                log.info(
+                    f"【Update】群晖：当前进程 user:group = {cur_user}:{cur_group}"
+                )
+                _, who, _ = _run(f"stat -c '%U:%G' {target_dir}", timeout=10)
+                log.info(
+                    f"【Update】群晖：目标目录 owner = {who.strip() if who else '未知'}"
+                )
+                # 列出 owner 不属于当前用户的文件（最多 5 条），非空就拒绝跑 update
+                _, bad_files, _ = _run(
+                    f"find {target_dir} \\( ! -user {cur_user} -o ! -group {cur_group} \\) "
+                    f"-print 2>/dev/null | head -5",
+                    timeout=60,
+                )
+                if bad_files and bad_files.strip():
+                    bad_lines = bad_files.strip().splitlines()
+                    log.error(
+                        f"【Update】群晖：发现 {len(bad_lines)} 个 owner 异常文件（前5条），"
+                        f"git 无法删除，拒绝执行更新:\n" + "\n".join(bad_lines)
+                    )
+                    return {
+                        "code": 1,
+                        "msg": (
+                            f"群晖目标目录存在 owner 不是套件用户 {cur_user} 的文件，"
+                            f"git reset 会失败。请 SSH 登录后用 root 执行：\n"
+                            f"sudo chown -R {cur_user}:{cur_group} {target_dir}\n"
+                            f"sudo chmod -R u+rwX,go+rX {target_dir}\n"
+                            f"示例异常文件：" + "; ".join(bad_lines[:3])
+                        ),
+                    }
+                # ===== 校验结束 =====
+
                 rc, out, err = _run("nastool update", timeout=1800)
                 # 注意：群晖 `nastool update` 即使 git reset 出现 Permission denied，
                 # 也常常以 rc=0 退出 + stdout 打印 "更新失败，继续使用旧的程序来启动..."。
@@ -1309,7 +1356,7 @@ class WebAction:
                             "群晖更新失败：检测到权限不足或 git 错误"
                             f"（命中关键字：{', '.join(hit_keywords[:3])}）。"
                             "请到 套件中心 → NASTool → 操作 → 修复，或登录 SSH 用 root 执行："
-                            "chown -R nt:nt /var/packages/NASTool/target  后再试。"
+                            f"sudo chown -R {cur_user}:{cur_group} /var/packages/NASTool/target  后再试。"
                         )
                     else:
                         log.error(f"【Update】群晖 nastool update 失败 rc={rc}，不重启")
