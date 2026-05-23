@@ -147,17 +147,23 @@ if [[ -z "$OWNER_REPO" || "$OWNER_REPO" == "$REMOTE_URL" ]]; then
   OWNER_REPO=""
 fi
 
-# ---------- 已有 tag / Release 状态判定 ----------
+# ---------- 已有 tag / Release / Docker 镜像状态判定 ----------
+# 完整发布物 = GitHub Release assets (binary 包) + Docker Hub 镜像 (stable 通道至少一个 tag)
 # 三种情况:
-#   A) tag 不存在               -> 走完整流程 (生成 changelog / commit / tag / push / 触发构建)
-#   B) tag 已存在 + Release 有安装包 -> 直接退出, 无事可做
-#   C) tag 已存在 + Release 无安装包 -> 跳过 commit/tag/push, 仅触发 build-package.yml 重新出包
+#   A) tag 不存在                                    -> 完整流程 (生成 changelog / commit / tag / push / 触发 build.yml + build-package.yml)
+#   B) tag 已存在 + Release 有 asset + Docker 镜像有 -> 直接退出, 无事可做
+#   C) tag 已存在, 缺 asset 或缺 Docker 镜像          -> 跳过 commit/tag/push, 缺啥补啥 (按需派发 build.yml / build-package.yml)
 #
-# 安装包存在性: 当对应 tag 的 GitHub Release 存在且至少有 1 个 asset 视为已发布。
+# 这套判定主要为修复 v3.4.2-beta.1 这种半成品状态:
+# 首次发布时 build.yml 也 startup_failure (僵尸队列触发软配额), 导致 tag 存在但 Docker 镜像和 binary 都没出。
+# 老逻辑在场景 C 只重跑 build-package.yml, Docker 镜像永远补不出来。
 TAG_EXISTS=false
-PACKAGE_EXISTS=false
+PACKAGE_EXISTS=false           # GitHub Release asset 是否齐
+DOCKER_IMAGE_EXISTS=false      # Docker Hub 镜像是否齐
 SKIP_COMMIT_TAG=false
-ONLY_REBUILD_PACKAGE=false
+ONLY_REBUILD_PACKAGE=false     # 仅重跑 build-package.yml
+ONLY_REBUILD_DOCKER=false      # 仅重跑 build.yml
+REBUILD_BOTH=false             # 两个都缺, 都重跑
 
 # 本地或远端任一存在即视为 tag 已存在
 if git rev-parse "$NEW_VERSION" >/dev/null 2>&1; then
@@ -187,52 +193,103 @@ if $TAG_EXISTS; then
       log "Release 状态: tag=$NEW_VERSION, assets=$asset_count"
     else
       log "未找到 $NEW_VERSION 的 GitHub Release"
+      asset_count=0
     fi
   else
     die "tag $NEW_VERSION 已存在, 但未安装 gh CLI, 无法判断 Release 是否已有安装包。
       请先安装: brew install gh, 然后 gh auth login"
   fi
 
-  if $PACKAGE_EXISTS; then
-    ok "tag $NEW_VERSION 已存在且 Release 已包含安装包 ($asset_count 个), 无需重复发布"
-    echo "    Release: https://github.com/$(git config --get remote.origin.url \
+  # 检查 Docker Hub 镜像是否存在 (stable 通道至少一个 tag 即视为成功)
+  # 优先级: $DOCKER_USERNAME -> 默认 joneezhu (与历史发布一致)
+  DOCKER_NS="${DOCKER_USERNAME:-joneezhu}"
+  DOCKER_REPO="${DOCKER_NS}/nastools"
+  log "检查 Docker Hub 镜像状态: $DOCKER_REPO:$NEW_VERSION"
+  set +e
+  docker_resp="$(curl -fsSL --max-time 10 "https://hub.docker.com/v2/repositories/${DOCKER_REPO}/tags/${NEW_VERSION}/" 2>/dev/null)"
+  docker_rc=$?
+  set -e
+  if [[ $docker_rc -eq 0 && -n "$docker_resp" ]]; then
+    # 有响应即存在 (404 时 curl -f 会非零退出, 不会走到这里)
+    DOCKER_IMAGE_EXISTS=true
+    log "Docker 镜像状态: $DOCKER_REPO:$NEW_VERSION 已存在"
+  else
+    log "Docker 镜像状态: $DOCKER_REPO:$NEW_VERSION 不存在"
+  fi
+
+  if $PACKAGE_EXISTS && $DOCKER_IMAGE_EXISTS; then
+    ok "tag $NEW_VERSION 已完整发布 (Release assets=$asset_count + Docker 镜像就位), 无需重复发布"
+    echo "    Release   : https://github.com/$(git config --get remote.origin.url \
                           | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases/tag/$NEW_VERSION"
+    echo "    Docker    : https://hub.docker.com/r/${DOCKER_REPO}/tags?name=$NEW_VERSION"
     exit 0
   fi
 
-  warn "tag $NEW_VERSION 已存在但 Release 缺少安装包, 将仅重跑 build-package.yml"
+  # 半成品: 至少一个产物缺失, 决定补哪一边
   SKIP_COMMIT_TAG=true
-  ONLY_REBUILD_PACKAGE=true
+  if ! $PACKAGE_EXISTS && ! $DOCKER_IMAGE_EXISTS; then
+    REBUILD_BOTH=true
+    warn "tag $NEW_VERSION 存在但 Release assets 与 Docker 镜像均缺失, 将重跑 build.yml + build-package.yml"
+  elif ! $PACKAGE_EXISTS; then
+    ONLY_REBUILD_PACKAGE=true
+    warn "tag $NEW_VERSION 存在但 Release 缺少安装包 (asset_count=$asset_count), 将仅重跑 build-package.yml"
+  else
+    ONLY_REBUILD_DOCKER=true
+    warn "tag $NEW_VERSION 存在但 Docker 镜像缺失, 将仅重跑 build.yml"
+  fi
 else
   [[ "$CUR_VERSION" == "$NEW_VERSION" ]] && die "目标版本与当前版本相同 (且未打 tag), 请先确认 version.py"
 fi
 
-# ---------- 仅重跑打包流水线模式 ----------
-if $ONLY_REBUILD_PACKAGE; then
+# ---------- 半成品补救模式 (场景 C) ----------
+if $SKIP_COMMIT_TAG; then
   if $DRY_RUN; then
-    warn "--dry-run, 仅重跑安装包模式: 不会实际触发 build-package.yml"
-    log "(本应触发) gh workflow run build-package.yml --ref $NEW_VERSION"
+    warn "--dry-run, 半成品补救模式: 不会实际派发 workflow"
+    if $REBUILD_BOTH;         then log "(本应触发) gh workflow run build.yml --ref $NEW_VERSION + build-package.yml"; fi
+    if $ONLY_REBUILD_PACKAGE; then log "(本应触发) gh workflow run build-package.yml --ref $NEW_VERSION"; fi
+    if $ONLY_REBUILD_DOCKER;  then log "(本应触发) gh workflow run build.yml --ref $NEW_VERSION"; fi
     exit 0
   fi
   if ! $RUN_BUILD; then
-    warn "默认未触发 CI (加 --build 才会派发 build-package.yml)"
+    warn "默认未触发 CI (加 --build 才会派发缺失的流水线)"
+    if $REBUILD_BOTH;         then echo "    缺: build.yml (Docker) + build-package.yml (binary)"; fi
+    if $ONLY_REBUILD_PACKAGE; then echo "    缺: build-package.yml (binary)"; fi
+    if $ONLY_REBUILD_DOCKER;  then echo "    缺: build.yml (Docker)"; fi
     echo "    需要触发请运行: scripts/release.sh $NEW_VERSION --build"
     exit 0
   fi
   : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN}"
 
-  log "通过 gh 触发 build-package.yml (基于已有 tag $NEW_VERSION 重新出包)..."
-  # 用 tag 作为 ref, 流水线里读到的 version.py 就是该 tag 上的版本
-  # 注意: build-package.yml 不接受任何 inputs (用 secrets.GITHUB_TOKEN 自动鉴权), 因此不要再传 -f github_token=...
-  gh workflow run build-package.yml --ref "$NEW_VERSION"
-  ok "build-package.yml 已派发 (ref=$NEW_VERSION)"
+  REPO_PATH="$(git config --get remote.origin.url | sed -E 's#.*github.com[:/](.*)\.git#\1#')"
+
+  if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
+    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
+    : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
+    log "通过 gh 触发 build.yml (Docker stable 通道, ref=$NEW_VERSION)..."
+    gh workflow run build.yml --ref "$NEW_VERSION" \
+      -f docker_username="$DOCKER_USERNAME" \
+      -f docker_password="$DOCKER_PASSWORD" \
+      -f channel=stable
+    ok "build.yml 已派发 (ref=$NEW_VERSION)"
+  fi
+
+  if $REBUILD_BOTH || $ONLY_REBUILD_PACKAGE; then
+    log "通过 gh 触发 build-package.yml (基于已有 tag $NEW_VERSION 重新出包)..."
+    # build-package.yml 不接受任何 inputs (用 secrets.GITHUB_TOKEN 自动鉴权), 不要再传 -f github_token=...
+    gh workflow run build-package.yml --ref "$NEW_VERSION"
+    ok "build-package.yml 已派发 (ref=$NEW_VERSION)"
+  fi
+
   echo
-  echo "    Actions  : https://github.com/$(git config --get remote.origin.url \
-                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/actions/workflows/build-package.yml"
-  echo "    Releases : https://github.com/$(git config --get remote.origin.url \
-                          | sed -E 's#.*github.com[:/](.*)\.git#\1#')/releases"
+  echo "    Actions    : https://github.com/${REPO_PATH}/actions"
+  if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
+    echo "    Docker Hub : https://hub.docker.com/r/${DOCKER_NS:-joneezhu}/nastools/tags?name=$NEW_VERSION"
+  fi
+  if $REBUILD_BOTH || $ONLY_REBUILD_PACKAGE; then
+    echo "    Releases   : https://github.com/${REPO_PATH}/releases/tag/$NEW_VERSION"
+  fi
   echo
-  ok "已为已有 tag $NEW_VERSION 重跑安装包流水线 ✅"
+  ok "已为已有 tag $NEW_VERSION 补全缺失产物 ✅"
   exit 0
 fi
 

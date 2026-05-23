@@ -257,16 +257,39 @@ jobs:
         # 职责分工:
         #   - 本步骤只负责上传 6 个平台二进制 assets, 并保证 Release 存在
         #   - Release 的 title / body (聚合 changelog) 由本地 scripts/release-github.sh 负责填充
-        # 注意:
-        #   - 不写 body, 避免覆盖本地脚本写入的聚合 changelog
-        #   - 不写 name, 让 GitHub 默认用 tag 名占位; 后续由 release-github.sh 修正
-        #   - 已存在 Release 时 action 会以 update 模式合并, 不会清空已有 body
-        uses: softprops/action-gh-release@v2
+        # 实现选择:
+        #   - 用 GitHub 官方 gh CLI (runner 自带, 不受仓库 Actions 白名单限制)
+        #   - 之前用 softprops/action-gh-release@v2, 但需要在 Settings→Actions 白名单里
+        #     额外放行 softprops/action-gh-release@*, 否则报 "is not allowed in joneezhu/NasTools"
+        # 行为细节:
+        #   - 不写 --notes / --title, 避免覆盖本地脚本写入的聚合 changelog
+        #   - prerelease 自动判断: tag 含 -beta./-rc./-alpha. 视为 prerelease
+        #   - 已存在 Release: 跳过创建, 只追加 (--clobber) 上传 asset, 保留 title/body
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ env.app_version }}
-          draft: false
-          prerelease: false
-          files: |
-            ${{ github.workspace }}/releases/*
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ env.app_version }}"
+          REL_DIR="${{ github.workspace }}/releases"
+
+          # 1) 确保 Release 存在
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, will upload assets to it"
+          else
+            PRERELEASE_FLAG=""
+            case "$TAG" in
+              *-beta.*|*-rc.*|*-alpha.*) PRERELEASE_FLAG="--prerelease" ;;
+            esac
+            echo "Creating Release $TAG (prerelease=${PRERELEASE_FLAG:-false})"
+            # --notes "" 显式空 body, 让本地 release-github.sh 后续覆盖
+            # --target 不传, gh 默认指向 tag 所指 commit
+            gh release create "$TAG" $PRERELEASE_FLAG --notes "" --title "$TAG"
+          fi
+
+          # 2) 上传所有 6 个平台 binary, --clobber 允许覆盖已有同名 asset
+          echo "Uploading assets from $REL_DIR"
+          ls -al "$REL_DIR"
+          gh release upload "$TAG" "$REL_DIR"/* --clobber
+
+          echo "✅ Release $TAG assets uploaded"
