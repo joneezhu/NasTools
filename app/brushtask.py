@@ -16,7 +16,7 @@ from app.message import Message
 from app.sites import Sites, SiteConf
 from app.utils import StringUtils, ExceptionUtils
 from app.utils.commons import singleton
-from app.utils.types import BrushDeleteType
+from app.utils.types import BrushDeleteType, SearchType
 from config import BRUSH_REMOVE_TORRENTS_INTERVAL, Config
 
 
@@ -684,6 +684,11 @@ class BrushTask(object):
         meta_info.set_torrent_info(site=site_info.get("name"),
                                    enclosure=enclosure,
                                    size=size)
+        # 透传刷流任务 ID，便于"种子已存在但目录不一致"时落 SITE_BRUSH_TORRENTS 过滤记录
+        try:
+            setattr(meta_info, "brush_task_id", taskid)
+        except Exception:
+            pass
         _, download_id, retmsg = self.downloader.download(
             media_info=meta_info,
             tag=tag,
@@ -691,7 +696,8 @@ class BrushTask(object):
             download_dir=download_dir,
             download_setting="-2",
             download_limit=download_limit,
-            upload_limit=upload_limit
+            upload_limit=upload_limit,
+            in_from=SearchType.BRUSH
         )
         if not download_id:
             # 下载失败

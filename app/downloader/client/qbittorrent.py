@@ -640,6 +640,63 @@ class Qbittorrent(_IDownloadClient):
     def set_torrent_tag(self, **kwargs):
         pass
 
+    def add_torrent_tags(self, ids, tags):
+        """
+        给已存在的种子追加标签（不影响其它已有标签）。
+        :param ids: 单个 hash 或 list
+        :param tags: 单个 tag 或 list
+        :return: bool
+        """
+        if not self.qbc or not ids or not tags:
+            return False
+        try:
+            tag_list = tags if isinstance(tags, (list, tuple, set)) else [tags]
+            tag_list = [t for t in tag_list if t]
+            if not tag_list:
+                return False
+            self.qbc.torrents_add_tags(tags=",".join(tag_list), torrent_hashes=ids)
+            return True
+        except Exception as err:
+            log.error(f"【{self.client_name}】{self.name} 追加标签出错：{str(err)}")
+            return False
+
+    def get_torrent_brief(self, tid):
+        """
+        获取已存在种子的关键信息：保存目录 / 标签集合 / 文件列表（统一结构）
+        :param tid: torrent hash
+        :return: {"hash","save_path","tags"(set),"files"(list[{name,selected}])} 或 None
+        """
+        if not self.qbc or not tid:
+            return None
+        try:
+            torrents = self.qbc.torrents_info(torrent_hashes=tid)
+            if not torrents:
+                return None
+            t = torrents[0]
+            tags_str = t.get("tags") if isinstance(t, dict) else getattr(t, "tags", "")
+            tag_set = {x.strip() for x in (tags_str or "").split(",") if x and x.strip()}
+            save_path = t.get("save_path") if isinstance(t, dict) else getattr(t, "save_path", "")
+            t_hash = t.get("hash") if isinstance(t, dict) else getattr(t, "hash", tid)
+            # 文件列表
+            files = []
+            try:
+                raw_files = self.qbc.torrents_files(torrent_hash=tid) or []
+                for f in raw_files:
+                    name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+                    priority = f.get("priority") if isinstance(f, dict) else getattr(f, "priority", 1)
+                    files.append({"name": name, "selected": int(priority or 0) > 0})
+            except Exception as ferr:
+                log.debug(f"【{self.client_name}】{self.name} 读取已存在种子文件列表异常：{str(ferr)}")
+            return {
+                "hash": t_hash,
+                "save_path": save_path or "",
+                "tags": tag_set,
+                "files": files,
+            }
+        except Exception as err:
+            log.error(f"【{self.client_name}】{self.name} 读取种子摘要出错：{str(err)}")
+            return None
+
     def get_download_dirs(self):
         if not self.qbc:
             return []
