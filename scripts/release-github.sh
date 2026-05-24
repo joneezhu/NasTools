@@ -150,6 +150,10 @@ else
   rc=$?
   set -e
   if [[ $rc -eq 0 && -n "$RELEASES_JSON" && "$RELEASES_JSON" != "[]" ]]; then
+    # 当目标是正式版 (无 -beta/-rc/-alpha 后缀) 时, 起点候选只保留正式版,
+    # 这样 v3.4.2 正式版的 changelog 区间是 (v3.4.1, v3.4.2], 而不是
+    # 只包含 v3.4.2-beta.7..v3.4.2 这一小段.
+    # 当目标本身是 prerelease 时, 起点候选保持任意类型 (含 prerelease).
     START_TAG="$(TARGET_TAG="$TAG" RELEASES_JSON="$RELEASES_JSON" python3 <<'PYEOF'
 import os, json, re
 target = os.environ.get("TARGET_TAG", "")
@@ -161,13 +165,24 @@ def vkey(t):
     return (x, y, z, 0 if suf else 1, suf or "")
 data = json.loads(raw)
 tk = vkey(target)
+target_is_stable = bool(tk and tk[3] == 1)
 candidates = []
 for r in data:
     if r.get("isDraft"): continue
     name = r.get("tagName", "")
     k = vkey(name)
-    if k and tk and k < tk:
-        candidates.append((k, name))
+    if not (k and tk and k < tk):
+        continue
+    if target_is_stable and k[3] == 0:
+        continue
+    candidates.append((k, name))
+if not candidates and target_is_stable:
+    for r in data:
+        if r.get("isDraft"): continue
+        name = r.get("tagName", "")
+        k = vkey(name)
+        if k and tk and k < tk:
+            candidates.append((k, name))
 if candidates:
     candidates.sort()
     print(candidates[-1][1])
