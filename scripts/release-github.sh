@@ -173,16 +173,11 @@ for r in data:
     k = vkey(name)
     if not (k and tk and k < tk):
         continue
+    # 正式版严格只看正式版起点; 找不到就让外层走 "聚合所有 commit" 路径,
+    # 绝不回落到 prerelease (例如 v3.4.2 正式版宁可聚合首个 commit, 也不接受 v3.4.2-beta.6 当起点).
     if target_is_stable and k[3] == 0:
         continue
     candidates.append((k, name))
-if not candidates and target_is_stable:
-    for r in data:
-        if r.get("isDraft"): continue
-        name = r.get("tagName", "")
-        k = vkey(name)
-        if k and tk and k < tk:
-            candidates.append((k, name))
 if candidates:
     candidates.sort()
     print(candidates[-1][1])

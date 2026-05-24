@@ -124,20 +124,17 @@ CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 $DRY_RUN || { log "git fetch --tags"; git fetch --tags --quiet; }
 
 # 取上一个 tag
-# 当目标是正式版 (无 -beta/-rc/-alpha 等后缀) 时, 起点 tag 也跳过所有 prerelease,
+# 当目标是正式版 (无 -beta/-rc/-alpha 等后缀) 时, 起点 tag 严格只看正式版,
+# 找不到则按 "首次发布" 处理 (从首个 commit 聚合), 绝不回落到 prerelease.
 # 这样 v3.4.2 正式版的 changelog 会从上一个正式版 (例如 v3.4.1) 算起,
-# 而不是只显示 v3.4.2-beta.7 -> v3.4.2 这一小段.
+# 而不是 v3.4.2-beta.7 -> v3.4.2 这一小段.
 # 当目标本身是 prerelease (例如 v3.4.2-beta.8) 时, 仍取最近的任意 tag (含 prerelease) 作为起点.
 if [[ "$NEW_VERSION" == *-* ]]; then
   # prerelease: 起点取最近一个 tag (任意类型)
   LAST_TAG="$(git tag --sort=-creatordate | head -n1 || true)"
 else
-  # 正式版: 起点取最近一个 "正式版" tag (跳过所有含 - 的 prerelease)
+  # 正式版: 起点取最近一个 "正式版" tag, 严格跳过所有 prerelease, 不做 fallback.
   LAST_TAG="$(git tag --sort=-creatordate | grep -Ev -- '-' | head -n1 || true)"
-  if [[ -z "$LAST_TAG" ]]; then
-    warn "未找到任何正式版 tag, 回落到最近一个 tag (含 prerelease)"
-    LAST_TAG="$(git tag --sort=-creatordate | head -n1 || true)"
-  fi
 fi
 if [[ -z "$LAST_TAG" ]]; then
   warn "未找到任何已有 tag, 将从首个 commit 起算"
