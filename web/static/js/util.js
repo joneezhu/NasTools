@@ -57,9 +57,23 @@ function ajax_post(cmd, params, handler, aync = true, show_progress = true) {
       if (show_progress) {
         NProgress.done();
       }
+      if (!handler) {
+        return;
+      }
       if (xhr && xhr.status === 200) {
         handler({code: 0});
+        return;
       }
+      // 网络异常 / 5xx / 超时：把错误回传给调用方，避免按钮永远 loading
+      let msg = "请求失败";
+      if (textStatus === "timeout") {
+        msg = "请求超时，请稍后重试";
+      } else if (xhr && xhr.status) {
+        msg = "请求失败：HTTP " + xhr.status;
+      } else if (textStatus) {
+        msg = "请求失败：" + textStatus;
+      }
+      handler({code: 1, msg: msg});
     }
   });
 }

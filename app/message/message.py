@@ -263,9 +263,13 @@ class Message(object):
             msg_text = f"{msg_text}\n描述：{can_item.description}"
         # 插入消息中心
         self.messagecenter.insert_system_message(title=msg_title, content=msg_text)
+        # 来源不同走不同的客户端开关：
+        #   - 刷流（BRUSH）→ brushtask_added（让用户能在"消息通知"页独立关闭刷流下种通知）
+        #   - 其它 → download_start
+        switch_key = "brushtask_added" if in_from == SearchType.BRUSH else "download_start"
         # 发送消息
         for client in self._active_clients:
-            if "download_start" in client.get("switchs"):
+            if switch_key in client.get("switchs"):
                 self.__sendmsg(
                     client=client,
                     title=msg_title,

@@ -83,6 +83,7 @@ class WebAction:
             "restart": self.__restart,
             "update_system": self.update_system,
             "update_progress": self.get_update_progress,
+            "list_remote_tags": self.list_remote_tags,
             "reset_db_version": self.__reset_db_version,
             "logout": self.__logout,
             "update_config": self.__update_config,
@@ -1247,6 +1248,12 @@ class WebAction:
     _UPDATE_LOCK = threading.Lock()
     _UPDATE_THREAD = None
 
+    # 本次更新用户指定的目标 ref（一次性，下次默认仍按 channel 配置）
+    _USER_REQUESTED_REF = ""
+
+    # remote tags 缓存：{"data": [...], "ts": <epoch>, "ttl": 60}
+    _REMOTE_TAGS_CACHE = {"data": None, "ts": 0, "ttl": 60}
+
     @classmethod
     def _update_log(cls, line):
         """追加一行到环形日志缓冲。多行字符串自动拆分。"""
@@ -1301,6 +1308,138 @@ class WebAction:
             ExceptionUtils.exception_traceback(e)
             return "master", "branch"
 
+    @staticmethod
+    def _is_prerelease_by_name(tag_name):
+        """根据 tag 名字推断是否预发版（用于 /tags 接口缺少 prerelease 字段）。"""
+        if not tag_name:
+            return False
+        low = tag_name.lower()
+        for kw in ("-beta", "-rc", "-alpha", "-pre", "-dev", "-snapshot"):
+            if kw in low:
+                return True
+        return False
+
+    def list_remote_tags(self, _data=None):
+        """
+        给前端列远端 tag。数据源：GitHub /repos/joneezhu/NasTools/tags?per_page=30。
+        - 60s 内存缓存（_REMOTE_TAGS_CACHE）
+        - 同时尝试拉一次 /releases?per_page=30 用来标注 prerelease（失败也不影响）
+        - 返回 {code, data: {current, tags:[{name, sha, prerelease}], channels:[...]}}
+        """
+        try:
+            # 缓存命中
+            cache = WebAction._REMOTE_TAGS_CACHE
+            now = int(time.time())
+            if cache.get("data") is not None and (now - cache.get("ts", 0)) < cache.get("ttl", 60):
+                return {"code": 0, "data": cache["data"]}
+
+            req = RequestUtils(proxies=Config().get_proxies())
+            # 1) tags（必需）
+            tags_res = req.get_res(
+                "https://api.github.com/repos/joneezhu/NasTools/tags?per_page=30"
+            )
+            if not tags_res or tags_res.status_code != 200:
+                code = getattr(tags_res, "status_code", "N/A") if tags_res else "N/A"
+                return {"code": 1, "msg": f"GitHub /tags 拉取失败 (status={code})"}
+            raw_tags = tags_res.json() or []
+
+            # 2) releases（可选，用于校正 prerelease 标识 + 拿 published_at）
+            prerelease_set = set()
+            published_map = {}
+            try:
+                rel_res = req.get_res(
+                    "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=30"
+                )
+                if rel_res and rel_res.status_code == 200:
+                    for r in (rel_res.json() or []):
+                        tn = r.get("tag_name")
+                        if not tn:
+                            continue
+                        if r.get("prerelease"):
+                            prerelease_set.add(tn)
+                        if r.get("published_at"):
+                            published_map[tn] = r.get("published_at")
+            except Exception:
+                pass  # release 拉不到只是没有 changelog/标识，不致命
+
+            # 3) 当前 commit/tag（尽量给前端高亮当前版本）
+            current_ref = ""
+            try:
+                workdir = os.getenv("WORKDIR") or "/nas-tools"
+                if os.path.isdir(os.path.join(workdir, ".git")):
+                    proc = subprocess.run(
+                        "git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD",
+                        shell=True, cwd=workdir,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if proc.returncode == 0 and proc.stdout:
+                        current_ref = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+            except Exception:
+                pass
+
+            # 3.1) version.py 里的语义化版本号（与 git ref 互补展示）
+            app_version = ""
+            try:
+                from version import APP_VERSION as _AV
+                app_version = str(_AV or "")
+            except Exception:
+                app_version = ""
+
+            tags = []
+            for t in raw_tags:
+                name = t.get("name") or ""
+                if not name:
+                    continue
+                tags.append({
+                    "name": name,
+                    "sha": (t.get("commit") or {}).get("sha", "")[:7],
+                    "prerelease": (name in prerelease_set) or self._is_prerelease_by_name(name),
+                    "published_at": published_map.get(name, ""),
+                })
+
+            data = {
+                "current": current_ref,
+                "app_version": app_version,
+                "tags": tags,
+                "channels": [
+                    {"key": "master", "label": "master 分支（最新代码）", "desc": "拉取 master HEAD"},
+                    {"key": "stable", "label": "最新稳定版（自动）", "desc": "排除预发版的最新 release"},
+                    {"key": "beta", "label": "最新含预发版（自动）", "desc": "包含 beta/rc 的最新 release"},
+                ],
+            }
+            WebAction._REMOTE_TAGS_CACHE = {"data": data, "ts": now, "ttl": 60}
+            return {"code": 0, "data": data}
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {"code": 1, "msg": f"拉取 tag 列表异常: {e}"}
+
+    @staticmethod
+    def _classify_target_ref(target_ref):
+        """
+        把前端传进来的 target_ref 分类成 (kind, ref, ref_type)。
+        - kind=channel: ref ∈ {master, stable, beta}，由 _resolve_update_ref 二次解析
+        - kind=explicit: ref 是具体 tag/branch 名字
+          - ref_type=tag 当 git ls-remote --tags origin <ref> 命中
+          - 否则当 branch
+        """
+        if not target_ref:
+            return "channel", "", "branch"
+        if target_ref in ("master", "stable", "beta"):
+            return "channel", target_ref, "branch"
+        # explicit：用 ls-remote 判断是 tag 还是 branch
+        workdir = os.getenv("WORKDIR") or "/nas-tools"
+        try:
+            proc = subprocess.run(
+                f"git ls-remote --tags origin {target_ref}",
+                shell=True, cwd=workdir,
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode == 0 and proc.stdout and proc.stdout.strip():
+                return "explicit", target_ref, "tag"
+        except Exception:
+            pass
+        return "explicit", target_ref, "branch"
+
     def get_update_progress(self, _data=None):
         """
         前端 SSE / 轮询接口。返回当前进度 + 最近 N 行日志。
@@ -1313,7 +1452,20 @@ class WebAction:
     def update_system(self, _data=None):
         """
         异步入口：立即返回，后台线程执行 _run_update_pipeline。
+        支持 _data.target_ref：
+          - 不传 / 空 → 走 update_channel 配置（旧行为）
+          - 'master'/'stable'/'beta' → 当作 channel
+          - 其它字符串 → 当作具体 tag/branch（ls-remote 判定）
         """
+        # 解析前端传入的 target_ref，规范化校验，避免命令注入
+        raw_ref = ""
+        if isinstance(_data, dict):
+            raw_ref = (_data.get("target_ref") or "").strip()
+        if raw_ref:
+            # 只允许 [A-Za-z0-9._/-]，长度不超过 80
+            if not re.match(r"^[A-Za-z0-9._/\-]{1,80}$", raw_ref):
+                return {"code": 1, "msg": f"非法 target_ref: {raw_ref}"}
+
         with WebAction._UPDATE_LOCK:
             if WebAction._UPDATE_THREAD and WebAction._UPDATE_THREAD.is_alive():
                 # 已经有线程在跑：拒绝重复触发，前端可以直接连 SSE 看现状
@@ -1323,6 +1475,9 @@ class WebAction:
                     "msg": "已有更新进程在执行，请稍等并查看进度面板",
                     "already_running": True,
                 }
+
+            # 把用户指定的 target_ref 暂存到类变量，供 _do_update_inner 读取
+            WebAction._USER_REQUESTED_REF = raw_ref
 
             # 重置进度状态
             WebAction._UPDATE_LOG_BUFFER.clear()
@@ -1384,14 +1539,32 @@ class WebAction:
             env = "host"
 
         # ---- 通道解析 ----
-        # 优先 Config.app.update_channel；兼容老的 NASTOOL_VERSION 环境变量（仅当 channel 缺省时）
+        # 优先级：用户在前端指定的 _USER_REQUESTED_REF > NASTOOL_VERSION 环境变量 > update_channel 配置
         app_cfg = Config().get_config("app") or {}
         channel = (app_cfg.get("update_channel") or "").strip().lower()
         if channel not in ("stable", "beta", "master"):
             # 老用户没配过：默认走 master，与原行为一致
             channel = "master"
+
+        user_ref = (WebAction._USER_REQUESTED_REF or "").strip()
+        # 用完即清，避免下次重启服务后被前端忘掉的旧值污染
+        WebAction._USER_REQUESTED_REF = ""
+
         env_branch = os.getenv("NASTOOL_VERSION")
-        if env_branch and channel == "master":
+
+        if user_ref:
+            kind, ref, ref_type = self._classify_target_ref(user_ref)
+            if kind == "channel":
+                # 用户在弹窗里选 master/stable/beta 时也走这里
+                channel = ref
+                target_ref, ref_type = self._resolve_update_ref(channel)
+                log.info(f"【Update】用户指定通道: {channel} → {target_ref} ({ref_type})")
+            else:
+                # 显式 tag/branch
+                channel = "custom"
+                target_ref = ref
+                log.info(f"【Update】用户指定 ref: {target_ref} ({ref_type})")
+        elif env_branch and channel == "master":
             # 显式环境变量覆盖（兼容老部署）
             target_ref, ref_type = env_branch, "branch"
             log.info(f"【Update】使用 NASTOOL_VERSION={env_branch} 环境变量覆盖通道")
@@ -1534,6 +1707,8 @@ class WebAction:
                     return
 
                 WebAction._update_set(phase="preflight", percent=10, message="配置 git 代理...")
+                # 永久免疫 bind mount 场景下的 dubious ownership 报错（host owner ≠ 容器 PUID 时 git 会拒绝操作）
+                _run(f"git config --global --add safe.directory {workdir}", cwd=workdir, allow_fail=True)
                 _run("git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
                 _run("git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
 
@@ -1600,6 +1775,7 @@ class WebAction:
             else:
                 # 裸机
                 WebAction._update_set(phase="preflight", percent=10, message="配置 git 代理...")
+                _run(f"sudo git config --global --add safe.directory {workdir}", cwd=workdir, allow_fail=True)
                 _run("sudo git config --global --unset http.proxy", cwd=workdir, allow_fail=True)
                 _run("sudo git config --global --unset https.proxy", cwd=workdir, allow_fail=True)
                 proxies = (Config().get_proxies() or {})
@@ -2424,7 +2600,7 @@ class WebAction:
         brushtask_exclude = data.get("brushtask_exclude")
         brushtask_dlcount = data.get("brushtask_dlcount")
         brushtask_current_site_count = data.get("brushtask_current_site_count")
-        brushtask_current_site_dlcount = data.get("dl")
+        brushtask_current_site_dlcount = data.get("brushtask_current_site_dlcount")
         brushtask_peercount = data.get("brushtask_peercount")
         brushtask_seedtime = data.get("brushtask_seedtime")
         brushtask_seedratio = data.get("brushtask_seedratio")
@@ -2478,8 +2654,12 @@ class WebAction:
             "remove_rule": remove_rule,
             "sendmessage": brushtask_sendmessage
         }
-        BrushTask().update_brushtask(brushtask_id, item)
-        return {"code": 0}
+        try:
+            BrushTask().update_brushtask(brushtask_id, item)
+            return {"code": 0}
+        except Exception as e:
+            ExceptionUtils.exception_traceback(e)
+            return {"code": 1, "msg": f"保存刷流任务失败：{str(e)}"}
 
     @staticmethod
     def __del_brushtask(data):
