@@ -1385,10 +1385,19 @@ class WebAction:
             except Exception:
                 app_version = ""
 
+            # 4) 是否仅 Release 模式：开 → tags 仅返回 Release 标签（即出现在 /releases 里的 tag），
+            #    不暴露 master 通道；关 → tags 全量，且暴露 master 通道。
+            app_cfg = Config().get_config("app") or {}
+            releases_only = bool(app_cfg.get("releases_update_only"))
+            release_tag_set = set(published_map.keys())  # /releases 里的 tag 集合
+
             tags = []
             for t in raw_tags:
                 name = t.get("name") or ""
                 if not name:
+                    continue
+                # releases_only 模式下，过滤掉非 Release 标签（仅是 git tag、未发 GitHub Release 的不算）
+                if releases_only and release_tag_set and name not in release_tag_set:
                     continue
                 tags.append({
                     "name": name,
@@ -1397,15 +1406,19 @@ class WebAction:
                     "published_at": published_map.get(name, ""),
                 })
 
+            if releases_only:
+                channels = []  # Release 模式不提供通道
+            else:
+                channels = [
+                    {"key": "master", "label": "master 分支（最新代码）", "desc": "拉取 master HEAD"},
+                ]
+
             data = {
                 "current": current_ref,
                 "app_version": app_version,
+                "releases_only": releases_only,
                 "tags": tags,
-                "channels": [
-                    {"key": "master", "label": "master 分支（最新代码）", "desc": "拉取 master HEAD"},
-                    {"key": "stable", "label": "最新稳定版（自动）", "desc": "排除预发版的最新 release"},
-                    {"key": "beta", "label": "最新含预发版（自动）", "desc": "包含 beta/rc 的最新 release"},
-                ],
+                "channels": channels,
             }
             WebAction._REMOTE_TAGS_CACHE = {"data": data, "ts": now, "ttl": 60}
             return {"code": 0, "data": data}
@@ -1453,7 +1466,7 @@ class WebAction:
         """
         异步入口：立即返回，后台线程执行 _run_update_pipeline。
         支持 _data.target_ref：
-          - 不传 / 空 → 走 update_channel 配置（旧行为）
+          - 不传 / 空 → 按 releases_update_only 决定默认目标（开=stable，关=master）
           - 'master'/'stable'/'beta' → 当作 channel
           - 其它字符串 → 当作具体 tag/branch（ls-remote 判定）
         """
@@ -1523,7 +1536,7 @@ class WebAction:
         相比原版主要改动:
         - 所有 log.* 同步写入 _UPDATE_LOG_BUFFER
         - 关键节点更新 _UPDATE_PROGRESS.phase/percent/message
-        - 支持 update_channel 配置（stable/beta/master）解析为目标 ref
+        - 默认目标按 releases_update_only 决定（开=stable，关=master）
         """
         log.info("【Update】===== 收到手动更新请求 (async) =====")
         WebAction._update_log("收到手动更新请求")
@@ -1539,12 +1552,11 @@ class WebAction:
             env = "host"
 
         # ---- 通道解析 ----
-        # 优先级：用户在前端指定的 _USER_REQUESTED_REF > NASTOOL_VERSION 环境变量 > update_channel 配置
+        # 优先级：用户在前端指定的 _USER_REQUESTED_REF > NASTOOL_VERSION 环境变量 > releases_update_only 默认
+        # 默认目标：releases_update_only 开 → 走 stable（最新正式 Release）；关 → 走 master 分支
         app_cfg = Config().get_config("app") or {}
-        channel = (app_cfg.get("update_channel") or "").strip().lower()
-        if channel not in ("stable", "beta", "master"):
-            # 老用户没配过：默认走 master，与原行为一致
-            channel = "master"
+        releases_only = bool(app_cfg.get("releases_update_only"))
+        channel = "stable" if releases_only else "master"
 
         user_ref = (WebAction._USER_REQUESTED_REF or "").strip()
         # 用完即清，避免下次重启服务后被前端忘掉的旧值污染
@@ -1567,7 +1579,7 @@ class WebAction:
         elif env_branch and channel == "master":
             # 显式环境变量覆盖（兼容老部署）
             target_ref, ref_type = env_branch, "branch"
-            log.info(f"【Update】使用 NASTOOL_VERSION={env_branch} 环境变量覆盖通道")
+            log.info(f"【Update】使用 NASTOOL_VERSION={env_branch} 环境变量覆盖默认通道")
         else:
             target_ref, ref_type = self._resolve_update_ref(channel)
         workdir = os.getenv("WORKDIR") or "/nas-tools"

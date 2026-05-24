@@ -354,7 +354,7 @@ function update(version) {
   show_update_picker_modal();
 }
 
-// 真正发起后台更新的小函数：target_ref 为空表示走 update_channel 配置
+// 真正发起后台更新的小函数：target_ref 为空表示后端按 releases_update_only 决定默认目标
 function _trigger_update(target_ref) {
   const payload = target_ref ? { target_ref: target_ref } : {};
   ajax_post("update_system", payload, function (ret) {
@@ -381,14 +381,16 @@ function show_update_picker_modal() {
       '      </div>' +
       '      <div class="modal-body">' +
       '        <div id="update-picker-current" class="small text-muted mb-2">当前版本：加载中...</div>' +
-      '        <div class="form-label">通道</div>' +
-      '        <div id="update-picker-channels" class="mb-3"></div>' +
+      '        <div id="update-picker-channel-row" class="mb-3" style="display:none;">' +
+      '          <div class="form-label">通道</div>' +
+      '          <div id="update-picker-channels"></div>' +
+      '        </div>' +
       '        <div class="form-label d-flex align-items-center justify-content-between">' +
-      '          <span>具体 Tag</span>' +
+      '          <span id="update-picker-tag-label">具体 Tag</span>' +
       '          <a href="javascript:void(0)" id="update-picker-refresh" class="small text-muted">刷新</a>' +
       '        </div>' +
-      '        <select id="update-picker-tag-select" class="form-select mb-2"><option value="">— 不指定（走通道）—</option></select>' +
-      '        <div class="small text-muted">提示：选了具体 Tag 时会优先生效，覆盖上面的通道选项。指定 Tag 仅本次生效，不写入配置。</div>' +
+      '        <select id="update-picker-tag-select" class="form-select mb-2"><option value="">— 加载中... —</option></select>' +
+      '        <div id="update-picker-tip" class="small text-muted">提示：选了具体 Tag 时会优先生效，覆盖上面的通道选项；通道与 Tag 二选一。指定 Tag 仅本次生效，不写入配置。</div>' +
       '      </div>' +
       '      <div class="modal-footer">' +
       '        <button type="button" class="btn btn-link link-secondary" data-bs-dismiss="modal">取消</button>' +
@@ -403,6 +405,19 @@ function show_update_picker_modal() {
     document.getElementById("update-picker-refresh").addEventListener("click", function () {
       _load_update_picker_data(true);
     });
+    // 通道与 Tag 二选一：选了 Tag(非空)就清空 channel 选择；选了 channel 就把 Tag 重置为空
+    document.getElementById("update-picker-tag-select").addEventListener("change", function () {
+      if (this.value) {
+        const radios = document.querySelectorAll('input[name="update-picker-channel"]');
+        radios.forEach(function (r) { r.checked = false; });
+      }
+    });
+    document.addEventListener("change", function (e) {
+      if (e.target && e.target.name === "update-picker-channel" && e.target.checked) {
+        const tagSel = document.getElementById("update-picker-tag-select");
+        if (tagSel) tagSel.value = "";
+      }
+    });
     document.getElementById("update-picker-confirm").addEventListener("click", function () {
       const tagSel = document.getElementById("update-picker-tag-select");
       const tag = tagSel ? tagSel.value : "";
@@ -412,14 +427,16 @@ function show_update_picker_modal() {
         const radios = document.querySelectorAll('input[name="update-picker-channel"]');
         radios.forEach(function (r) { if (r.checked) target_ref = r.value; });
       }
+      if (!target_ref) {
+        show_fail_modal("请选择要更新的通道或具体 Tag");
+        return;
+      }
       // 关弹窗 → 二次确认 → 启动
       const inst = bootstrap.Modal.getInstance(document.getElementById("modal-update-picker"));
       if (inst) inst.hide();
-      const display = target_ref || "master";
-      show_confirm_modal("将更新到 " + display + "，未提交的本地修改会丢失，确认继续？", function () {
+      show_confirm_modal("将更新到 " + target_ref + "，未提交的本地修改会丢失，确认继续？", function () {
         hide_confirm_modal();
-        // master 也作为显式参数传后端，便于日志清晰
-        _trigger_update(target_ref || "master");
+        _trigger_update(target_ref);
       });
     });
   }
@@ -433,8 +450,10 @@ function show_update_picker_modal() {
 
 function _load_update_picker_data(force) {
   const curEl = document.getElementById("update-picker-current");
+  const chRow = document.getElementById("update-picker-channel-row");
   const chEl = document.getElementById("update-picker-channels");
   const tagEl = document.getElementById("update-picker-tag-select");
+  const tipEl = document.getElementById("update-picker-tip");
   if (curEl) curEl.textContent = "当前版本：加载中...";
   if (chEl) chEl.innerHTML = '<div class="text-muted small">加载中...</div>';
   if (tagEl) tagEl.innerHTML = '<option value="">— 加载中... —</option>';
@@ -448,6 +467,8 @@ function _load_update_picker_data(force) {
       return;
     }
     const data = ret.data;
+    const releasesOnly = !!data.releases_only;
+
     if (curEl) {
       const av = data.app_version ? String(data.app_version).trim() : "";
       const cr = data.current ? String(data.current).trim() : "";
@@ -462,28 +483,54 @@ function _load_update_picker_data(force) {
       curEl.textContent = "当前版本：" + txt;
     }
 
-    // 渲染 channel
-    if (chEl) {
+    // 通道行：releases_only 模式直接隐藏；否则只列出 master
+    const channels = data.channels || [];
+    if (releasesOnly || channels.length === 0) {
+      if (chRow) chRow.style.display = "none";
+      if (chEl) chEl.innerHTML = "";
+    } else {
+      if (chRow) chRow.style.display = "";
       let chHtml = "";
-      (data.channels || []).forEach(function (c, idx) {
+      channels.forEach(function (c, idx) {
         const id = "update-ch-" + c.key;
         chHtml += '<label class="form-check">' +
           '<input class="form-check-input" type="radio" name="update-picker-channel" id="' + id + '" value="' + c.key + '"' + (idx === 0 ? ' checked' : '') + '>' +
           '<span class="form-check-label">' + c.label + '<span class="text-muted small ms-2">' + (c.desc || '') + '</span></span>' +
           '</label>';
       });
-      chEl.innerHTML = chHtml;
+      if (chEl) chEl.innerHTML = chHtml;
     }
 
-    // 渲染 tag 列表
+    // 标签下拉：releases_only 模式必须选一个；否则可"不指定（走通道）"
     if (tagEl) {
-      let opts = '<option value="">— 不指定（走通道）—</option>';
+      let opts = "";
+      if (releasesOnly) {
+        opts = '<option value="">— 请选择一个 Release Tag —</option>';
+      } else {
+        opts = '<option value="">— 不指定（走通道）—</option>';
+      }
       (data.tags || []).forEach(function (t) {
         const label = t.name + (t.prerelease ? "  (pre)" : "") + (t.sha ? "  · " + t.sha : "");
         const isCurrent = data.current && data.current === t.name;
         opts += '<option value="' + t.name + '"' + (isCurrent ? ' selected' : '') + '>' + label + (isCurrent ? '  ← 当前' : '') + '</option>';
       });
       tagEl.innerHTML = opts;
+      // releases_only 模式且选项中有 current 已被 selected，否则保持空选
+      if (releasesOnly) {
+        // 触发一次 change 把 channel 清掉（即便 channel 已经是隐藏）
+        const evt = document.createEvent("Event");
+        evt.initEvent("change", true, true);
+        tagEl.dispatchEvent(evt);
+      }
+    }
+
+    // 提示文案
+    if (tipEl) {
+      if (releasesOnly) {
+        tipEl.textContent = "提示：当前为「仅检查 Release 更新」模式，仅可选择已发布的 Release 标签。指定 Tag 仅本次生效，不写入配置。";
+      } else {
+        tipEl.textContent = "提示：通道与具体 Tag 二选一。选了 Tag 优先生效，会清空通道选择；选了通道则不指定 Tag。指定 Tag 仅本次生效，不写入配置。";
+      }
     }
   }, true, false);
 }
