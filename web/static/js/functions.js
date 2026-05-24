@@ -341,27 +341,139 @@ function restart() {
   });
 }
 
-//更新
+//更新：先弹"选版本"弹窗，用户选完目标 ref 再触发后台更新
 function update(version) {
-  let title;
+  // 兼容老调用：version 传具体 tag 字符串则直接走二次确认（不弹选择器）
   if (version) {
-    title = "是否确认更新到 " + version + " 版本？";
-  } else {
-    title = "将从 GitHub 拉取最新程序代码并重启，是否确认？";
+    show_confirm_modal("是否确认更新到 " + version + " 版本？", function () {
+      hide_confirm_modal();
+      _trigger_update(version);
+    });
+    return;
   }
-  show_confirm_modal(title, function () {
-    hide_confirm_modal();
+  show_update_picker_modal();
+}
 
-    // 触发后台异步更新（立即返回），然后展示进度面板用 SSE 推进度
-    ajax_post("update_system", {}, function (ret) {
-      if (ret && (ret.code === 0 || ret.async || ret.already_running)) {
-        show_update_progress_modal();
-      } else {
-        const msg = (ret && ret.msg) ? ret.msg : "更新启动失败";
-        show_fail_modal("更新启动失败：" + msg);
+// 真正发起后台更新的小函数：target_ref 为空表示走 update_channel 配置
+function _trigger_update(target_ref) {
+  const payload = target_ref ? { target_ref: target_ref } : {};
+  ajax_post("update_system", payload, function (ret) {
+    if (ret && (ret.code === 0 || ret.async || ret.already_running)) {
+      show_update_progress_modal();
+    } else {
+      const msg = (ret && ret.msg) ? ret.msg : "更新启动失败";
+      show_fail_modal("更新启动失败：" + msg);
+    }
+  }, true, false);
+}
+
+// 展示版本选择器
+function show_update_picker_modal() {
+  // 第一次构建 DOM
+  if (!document.getElementById("modal-update-picker")) {
+    const html = '' +
+      '<div class="modal modal-blur fade" id="modal-update-picker" tabindex="-1" role="dialog" aria-hidden="true">' +
+      '  <div class="modal-dialog modal-dialog-centered" role="document">' +
+      '    <div class="modal-content">' +
+      '      <div class="modal-header">' +
+      '        <h5 class="modal-title">选择更新版本</h5>' +
+      '        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>' +
+      '      </div>' +
+      '      <div class="modal-body">' +
+      '        <div id="update-picker-current" class="small text-muted mb-2">当前版本：加载中...</div>' +
+      '        <div class="form-label">通道</div>' +
+      '        <div id="update-picker-channels" class="mb-3"></div>' +
+      '        <div class="form-label d-flex align-items-center justify-content-between">' +
+      '          <span>具体 Tag</span>' +
+      '          <a href="javascript:void(0)" id="update-picker-refresh" class="small text-muted">刷新</a>' +
+      '        </div>' +
+      '        <select id="update-picker-tag-select" class="form-select mb-2"><option value="">— 不指定（走通道）—</option></select>' +
+      '        <div class="small text-muted">提示：选了具体 Tag 时会优先生效，覆盖上面的通道选项。指定 Tag 仅本次生效，不写入配置。</div>' +
+      '      </div>' +
+      '      <div class="modal-footer">' +
+      '        <button type="button" class="btn btn-link link-secondary" data-bs-dismiss="modal">取消</button>' +
+      '        <button type="button" class="btn btn-primary" id="update-picker-confirm">开始更新</button>' +
+      '      </div>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>';
+    document.body.insertAdjacentHTML("beforeend", html);
+
+    // 绑定事件
+    document.getElementById("update-picker-refresh").addEventListener("click", function () {
+      _load_update_picker_data(true);
+    });
+    document.getElementById("update-picker-confirm").addEventListener("click", function () {
+      const tagSel = document.getElementById("update-picker-tag-select");
+      const tag = tagSel ? tagSel.value : "";
+      let target_ref = tag;
+      if (!target_ref) {
+        // 没选 tag → 用选中的 channel
+        const radios = document.querySelectorAll('input[name="update-picker-channel"]');
+        radios.forEach(function (r) { if (r.checked) target_ref = r.value; });
       }
-    }, true, false);
-  });
+      // 关弹窗 → 二次确认 → 启动
+      const inst = bootstrap.Modal.getInstance(document.getElementById("modal-update-picker"));
+      if (inst) inst.hide();
+      const display = target_ref || "master";
+      show_confirm_modal("将更新到 " + display + "，未提交的本地修改会丢失，确认继续？", function () {
+        hide_confirm_modal();
+        // master 也作为显式参数传后端，便于日志清晰
+        _trigger_update(target_ref || "master");
+      });
+    });
+  }
+
+  const el = document.getElementById("modal-update-picker");
+  bootstrap.Modal.getOrCreateInstance(el).show();
+
+  // 加载数据
+  _load_update_picker_data(false);
+}
+
+function _load_update_picker_data(force) {
+  const curEl = document.getElementById("update-picker-current");
+  const chEl = document.getElementById("update-picker-channels");
+  const tagEl = document.getElementById("update-picker-tag-select");
+  if (curEl) curEl.textContent = "当前版本：加载中...";
+  if (chEl) chEl.innerHTML = '<div class="text-muted small">加载中...</div>';
+  if (tagEl) tagEl.innerHTML = '<option value="">— 加载中... —</option>';
+
+  ajax_post("list_remote_tags", { _t: force ? Date.now() : 0 }, function (ret) {
+    if (!ret || ret.code !== 0 || !ret.data) {
+      const msg = (ret && ret.msg) ? ret.msg : "拉取版本列表失败";
+      if (curEl) curEl.textContent = "当前版本：未知";
+      if (chEl) chEl.innerHTML = '<div class="text-danger small">' + msg + '，请稍后重试或检查代理。</div>';
+      if (tagEl) tagEl.innerHTML = '<option value="">— ' + msg + ' —</option>';
+      return;
+    }
+    const data = ret.data;
+    if (curEl) curEl.textContent = "当前版本：" + (data.current || "未知");
+
+    // 渲染 channel
+    if (chEl) {
+      let chHtml = "";
+      (data.channels || []).forEach(function (c, idx) {
+        const id = "update-ch-" + c.key;
+        chHtml += '<label class="form-check">' +
+          '<input class="form-check-input" type="radio" name="update-picker-channel" id="' + id + '" value="' + c.key + '"' + (idx === 0 ? ' checked' : '') + '>' +
+          '<span class="form-check-label">' + c.label + '<span class="text-muted small ms-2">' + (c.desc || '') + '</span></span>' +
+          '</label>';
+      });
+      chEl.innerHTML = chHtml;
+    }
+
+    // 渲染 tag 列表
+    if (tagEl) {
+      let opts = '<option value="">— 不指定（走通道）—</option>';
+      (data.tags || []).forEach(function (t) {
+        const label = t.name + (t.prerelease ? "  (pre)" : "") + (t.sha ? "  · " + t.sha : "");
+        const isCurrent = data.current && data.current === t.name;
+        opts += '<option value="' + t.name + '"' + (isCurrent ? ' selected' : '') + '>' + label + (isCurrent ? '  ← 当前' : '') + '</option>';
+      });
+      tagEl.innerHTML = opts;
+    }
+  }, true, false);
 }
 
 // 全局 EventSource 引用，用于关闭面板时清理
