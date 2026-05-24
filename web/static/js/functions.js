@@ -448,7 +448,19 @@ function _load_update_picker_data(force) {
       return;
     }
     const data = ret.data;
-    if (curEl) curEl.textContent = "当前版本：" + (data.current || "未知");
+    if (curEl) {
+      const av = data.app_version ? String(data.app_version).trim() : "";
+      const cr = data.current ? String(data.current).trim() : "";
+      let txt = "未知";
+      if (av && cr) {
+        txt = av + "（" + cr + "）";
+      } else if (av) {
+        txt = av;
+      } else if (cr) {
+        txt = cr;
+      }
+      curEl.textContent = "当前版本：" + txt;
+    }
 
     // 渲染 channel
     if (chEl) {

@@ -1377,6 +1377,14 @@ class WebAction:
             except Exception:
                 pass
 
+            # 3.1) version.py 里的语义化版本号（与 git ref 互补展示）
+            app_version = ""
+            try:
+                from version import APP_VERSION as _AV
+                app_version = str(_AV or "")
+            except Exception:
+                app_version = ""
+
             tags = []
             for t in raw_tags:
                 name = t.get("name") or ""
@@ -1391,6 +1399,7 @@ class WebAction:
 
             data = {
                 "current": current_ref,
+                "app_version": app_version,
                 "tags": tags,
                 "channels": [
                     {"key": "master", "label": "master 分支（最新代码）", "desc": "拉取 master HEAD"},
