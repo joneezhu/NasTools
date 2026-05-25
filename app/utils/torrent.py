@@ -448,9 +448,14 @@ class Torrent:
     @staticmethod
     def format_enclosure(link):
         """
-        格式化一个链接
-        如果是磁力链接或者为私有PT站点则直接返回
-        如果不是磁力链接看是否是种子链接，如果是则下载种子后转换为磁力链接
+        格式化/校验下载链接，仅做 URL 层面的判定，**绝不在此函数内下载种子**：
+          - 空/非 str：返回 None
+          - 磁力链 (magnet:)：原样返回
+          - 看起来像种子 URL（http(s):// 且符合 maybe_torrent_url）：原样返回
+          - 其它情况：返回 None
+        历史上这里曾会 GET 链接并把二进制 .torrent 内容塞回 enclosure，
+        导致下游 url.startswith("magnet:") 报 "first arg must be bytes" 之类的奇怪错误。
+        统一收敛为只做 URL 整形，下载交给 __resolve_torrent_content 处理。
         """
         if not StringUtils.is_string_and_not_empty(link):
             return None
@@ -458,9 +463,4 @@ class Torrent:
             return link
         if not Torrent.maybe_torrent_url(link):
             return None
-
-        _, torrent_content, _, _, retmsg = Torrent().get_torrent_info(link)
-        if not torrent_content:
-            print(f"下载种子文件出错: {retmsg}")
-            return None
-        return torrent_content
+        return link

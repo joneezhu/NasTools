@@ -577,7 +577,7 @@ class WebAction:
             media = Media().get_media_info(title=res.TORRENT_NAME, subtitle=res.DESCRIPTION)
             if not media:
                 continue
-            media.set_torrent_info(enclosure=res.ENCLOSURE,
+            media.set_torrent_info(enclosure=dl_enclosure,
                                    size=res.SIZE,
                                    site=res.SITE,
                                    page_url=res.PAGEURL,
@@ -620,7 +620,8 @@ class WebAction:
             return {"code": -1, "msg": "种子信息有误"}
         media = Media().get_media_info(title=title, subtitle=description)
         media.site = site
-        media.enclosure = enclosure if Sites().get_sites_by_url_domain(enclosure) else Torrent.format_enclosure(enclosure)
+        # format_enclosure 只做 URL 校验/整形，命中私有站直接放行；否则做一次磁力/种子URL校验，校验不过保留原值，由下游兜底处理
+        media.enclosure = enclosure if Sites().get_sites_by_url_domain(enclosure) else (Torrent.format_enclosure(enclosure) or enclosure)
         media.page_url = page_url
         media.size = size
         media.upload_volume_factor = float(uploadvolumefactor)
