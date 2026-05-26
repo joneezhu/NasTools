@@ -759,6 +759,7 @@ class BrushTask(object):
         :return: 是否命中
         """
         if not rss_rule:
+            log.debug("【Brush】%s 没有配置规则，默认成功" % (title))
             return True
         # 检查种子大小
         try:
@@ -879,7 +880,7 @@ class BrushTask(object):
 
         except Exception as err:
             ExceptionUtils.exception_traceback(err)
-
+        log.info("【Brush】%s 通过所有规则检查" % title)
         return True
 
     @staticmethod
