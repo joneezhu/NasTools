@@ -758,6 +758,7 @@ class BrushTask(object):
         :param apikey: Api-Key
         :return: 是否命中
         """
+        log.debug("【Brush】%s 开始检查种子规则" % (title))
         if not rss_rule:
             log.debug("【Brush】%s 没有配置规则，默认成功" % (title))
             return True
