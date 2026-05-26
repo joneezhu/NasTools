@@ -880,6 +880,7 @@ class BrushTask(object):
                         return False
 
         except Exception as err:
+            log.error("【Brush】%s 规则检查异常: %s" % (title, str(err)))
             ExceptionUtils.exception_traceback(err)
         log.info("【Brush】%s 通过所有规则检查" % title)
         return True
