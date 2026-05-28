@@ -2,7 +2,7 @@ import random
 import time
 import re
 import log
-from functools import lru_cache
+from threading import Lock
 
 from lxml import etree
 
@@ -14,9 +14,15 @@ from web.backend.pro_user import ProUser
 from urllib import parse
 from app.apis import MTeamApi
 
+
 @singleton
 class SiteConf:
     user = None
+    # 页面HTML缓存: {(url, cookie, ua, render, proxy): (timestamp, html_text)}
+    _page_cache = {}
+    _page_cache_lock = Lock()
+    # 缓存过期时间（秒）
+    _PAGE_CACHE_TTL = 300
     # 站点签到支持的识别XPATH
     _SITE_CHECKIN_XPATH = [
         '//a[@id="signed"]',
@@ -135,24 +141,34 @@ class SiteConf:
         try:
             html = etree.HTML(html_text)
             # 检测2XFREE
-            for xpath_str in xpath_strs.get("2XFREE"):
-                if html.xpath(xpath_str):
-                    ret_attr["free"] = True
-                    ret_attr["2xfree"] = True
-                    ret_attr["downloadvolumefactor"] = 0
-                    ret_attr["uploadvolumefactor"] = 2.0
+            for xpath_str in xpath_strs.get("2XFREE", []):
+                elements = html.xpath(xpath_str)
+                if elements:
+                    elem_text = ''.join(elements[0].itertext()).strip()
+                    if elem_text:
+                        ret_attr["free"] = True
+                        ret_attr["2xfree"] = True
+                        ret_attr["downloadvolumefactor"] = 0
+                        ret_attr["uploadvolumefactor"] = 2.0
+                        log.debug("【Brush】匹配2XFREE, xpath: %s, text: %s" % (xpath_str, elem_text[:50]))
+                        break
             # 检测FREE
-            for xpath_str in xpath_strs.get("FREE"):
-                if html.xpath(xpath_str):
-                    ret_attr["free"] = True
-                    ret_attr["downloadvolumefactor"] = 0
-                    ret_attr["uploadvolumefactor"] = 1.0
+            for xpath_str in xpath_strs.get("FREE", []):
+                elements = html.xpath(xpath_str)
+                if elements:
+                    elem_text = ''.join(elements[0].itertext()).strip()
+                    if elem_text:
+                        ret_attr["free"] = True
+                        ret_attr["downloadvolumefactor"] = 0
+                        ret_attr["uploadvolumefactor"] = 1.0
+                        log.debug("【Brush】匹配FREE, xpath: %s, text: %s" % (xpath_str, elem_text[:50]))
+                        break
             # 检测HR
-            for xpath_str in xpath_strs.get("HR"):
+            for xpath_str in xpath_strs.get("HR", []):
                 if html.xpath(xpath_str):
                     ret_attr["hr"] = True
             # 检测PEER_COUNT当前做种人数
-            for xpath_str in xpath_strs.get("PEER_COUNT"):
+            for xpath_str in xpath_strs.get("PEER_COUNT", []):
                 peer_count_dom = html.xpath(xpath_str)
                 if peer_count_dom:
                     peer_count_str = ''.join(peer_count_dom[0].itertext())
@@ -169,16 +185,26 @@ class SiteConf:
         time.sleep(round(random.uniform(1, 5), 1))
         return ret_attr
 
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def __get_site_page_html(url, cookie, ua, render=False, proxy=False):
-        chrome = ChromeHelper(headless=True)
-        if render and chrome.get_status():
-            # 开渲染
-            if chrome.visit(url=url, cookie=cookie, ua=ua, proxy=proxy):
-                # 等待页面加载完成
-                time.sleep(10)
-                return chrome.get_html()
+    @classmethod
+    def __get_site_page_html(cls, url, cookie, ua, render=False, proxy=False):
+        cache_key = (url, cookie, ua, render, proxy)
+        current_time = time.time()
+        # 检查缓存（带TTL过期）
+        with cls._page_cache_lock:
+            cached = cls._page_cache.get(cache_key)
+            if cached:
+                cached_time, cached_html = cached
+                if current_time - cached_time < cls._PAGE_CACHE_TTL:
+                    return cached_html
+                else:
+                    del cls._page_cache[cache_key]
+        # 抓取页面
+        html_text = None
+        if render:
+            with ChromeHelper(headless=True) as chrome:
+                if chrome.get_status() and chrome.visit(url=url, cookie=cookie, ua=ua, proxy=proxy):
+                    time.sleep(10)
+                    html_text = chrome.get_html()
         else:
             res = RequestUtils(
                 cookies=cookie,
@@ -187,5 +213,15 @@ class SiteConf:
             ).get_res(url=url)
             if res and res.status_code == 200:
                 res.encoding = res.apparent_encoding
-                return res.text
-        return ""
+                html_text = res.text
+        # 写入缓存并清理过期条目
+        if html_text:
+            with cls._page_cache_lock:
+                cls._page_cache[cache_key] = (current_time, html_text)
+                # 缓存超过200条时清理过期条目
+                if len(cls._page_cache) > 200:
+                    expired_keys = [k for k, v in cls._page_cache.items()
+                                    if current_time - v[0] > cls._PAGE_CACHE_TTL]
+                    for k in expired_keys:
+                        del cls._page_cache[k]
+        return html_text

@@ -166,23 +166,13 @@
             <div class="row">
               <div class="col-lg">
                 <div class="mb-3">
-                  <label class="form-label">更新通道
-                    <span class="form-help"
-                          title="控制网页一键更新拉取的目标版本：<br>• 稳定版（stable）：拉最新非 prerelease 的 Release tag，最稳，推荐生产<br>• 测试版（beta）：拉最新含 prerelease 的 tag，能尝鲜新特性，可能不稳<br>• Master：直接拉 master 分支 HEAD，最新但未发版本，仅开发用<br>注意：切换通道仅影响下次手动更新，不会自动回滚到旧版本"
-                          data-bs-toggle="tooltip" data-bs-html="true">?</span>
-                  </label>
-                  <select class="form-select" id="app.update_channel">
-                    <option value="stable" {% if (Config.app.update_channel or 'master') == 'stable' %}selected{% endif %}>稳定版（最新 Release）</option>
-                    <option value="beta"   {% if Config.app.update_channel == 'beta'   %}selected{% endif %}>测试版（含 Beta）</option>
-                    <option value="master" {% if (Config.app.update_channel or 'master') == 'master' %}selected{% endif %}>Master 分支（开发版）</option>
-                  </select>
-                </div>
-              </div>
-              <div class="col-lg">
-                <div class="mb-3">
                   <label class="form-check form-switch mt-4">
                     <input class="form-check-input" type="checkbox" id="app.releases_update_only" {% if Config.app.releases_update_only %}checked{% endif %}>
-                    <span class="form-check-label">仅检查Release更新 <span class="form-help" title="开启后，版本检查仅以 Release tag 为依据；通道选 stable/beta 时建议同时开启" data-bs-toggle="tooltip">?</span></span>
+                    <span class="form-check-label">仅检查Release更新
+                      <span class="form-help"
+                            title="开启：版本检查与一键更新均仅以 Release tag 为依据，更新弹窗只列出 Release 标签；<br>关闭：检查 master 最新 commit 是否更新，弹窗中提供 master 分支与所有 tag 标签可选（通道与具体 Tag 二选一）。"
+                            data-bs-toggle="tooltip" data-bs-html="true">?</span>
+                    </span>
                   </label>
                 </div>
               </div>

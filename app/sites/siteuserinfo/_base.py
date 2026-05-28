@@ -247,18 +247,18 @@ class _ISiteUserInfo(metaclass=ABCMeta):
             # 如果cloudflare 有防护，尝试使用浏览器仿真
             if under_challenge(res.text):
                 log.debug(f"【Sites】{self.site_name} 检测到Cloudflare，需要浏览器仿真")
-                chrome = ChromeHelper()
-                if self._emulate and chrome.get_status():
-                    if not chrome.visit(url=url, ua=self._ua, apikey=self._apikey, cookie=self._site_cookie, proxy=self._proxy):
-                        log.error(f"【Sites】{self.site_name} 无法打开网站")
-                        return ""
-                    # 循环检测是否过cf
-                    cloudflare = chrome.pass_cloudflare()
-                    if not cloudflare:
-                        log.error(f"【Sites】{self.site_name} 跳转站点失败")
-                        return ""
-                    return chrome.get_html()
-                else:
+                if self._emulate:
+                    with ChromeHelper() as chrome:
+                        if chrome.get_status():
+                            if not chrome.visit(url=url, ua=self._ua, apikey=self._apikey, cookie=self._site_cookie, proxy=self._proxy):
+                                log.error(f"【Sites】{self.site_name} 无法打开网站")
+                                return ""
+                            # 循环检测是否过cf
+                            cloudflare = chrome.pass_cloudflare()
+                            if not cloudflare:
+                                log.error(f"【Sites】{self.site_name} 跳转站点失败")
+                                return ""
+                            return chrome.get_html()
                     log.warn(
                         f"【Sites】{self.site_name} 检测到Cloudflare，需要浏览器仿真，但是浏览器不可用或者未开启浏览器仿真")
                     return ""

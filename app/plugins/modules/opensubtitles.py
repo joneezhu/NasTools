@@ -206,16 +206,16 @@ class OpenSubtitles(_IPluginModule):
         """
         搜索并解析结果
         """
-        chrome = ChromeHelper()
-        if not chrome.get_status():
-            return []
-        # 访问页面
-        if not chrome.visit(url):
-            return []
-        # 源码
-        html_text = chrome.get_html()
-        # Cookie
-        cls._cookie = chrome.get_cookies()
+        with ChromeHelper() as chrome:
+            if not chrome.get_status():
+                return []
+            # 访问页面
+            if not chrome.visit(url):
+                return []
+            # 源码
+            html_text = chrome.get_html()
+            # Cookie
+            cls._cookie = chrome.get_cookies()
         # 解析列表
         ret_subtitles = []
         html_doc = PyQuery(html_text)

@@ -182,17 +182,20 @@ gh auth login
 # 浏览器自动打开授权, 完成后回到终端
 ```
 
-##### 方式 B：用 `.release` 中的 RELEASE_GH_TOKEN 静默登录（推荐 CI / 多账号）
+位置 B：用 `.release` 中的 RELEASE_GH_TOKEN 静默登录（推荐 CI / 多账号）
 
 在 `.release` 中追加一行（让 `gh` 自动读环境变量、完全无交互）：
 
 ```bash
 # .release
-DOCKER_USERNAME=joneechu
-DOCKER_PASSWORD=dckr_pat_xxx
+DOCKER_USERNAME=joneechu    # release.sh 检查 Docker Hub 镜像状态用
 RELEASE_GH_TOKEN=github_pat_xxx
-GH_TOKEN=$RELEASE_GH_TOKEN          # 让 gh CLI 自动认证, 无需 gh auth login
+GH_TOKEN=$RELEASE_GH_TOKEN  # 让 gh CLI 自动认证, 无需 gh auth login
 ```
+
+> `DOCKER_PASSWORD` 不再由 `.release` 或 `release.sh` 传递，
+> 已改为在 GitHub Secrets 中配置（`build.yml` 直接读取 `secrets.DOCKER_USERNAME` / `secrets.DOCKER_PASSWORD`）。
+> 配置路径：GitHub 仓库 → Settings → Secrets and variables → Actions。
 
 或者一次性写入：
 
@@ -216,12 +219,25 @@ gh workflow list -R joneezhu/NasTools
 
 #### 首次使用：配置凭据
 
+##### 本地凭据（`.release`）
+
 ```bash
 cp .release.example .release
-# 编辑 .release, 填入 DOCKER_USERNAME / DOCKER_PASSWORD / RELEASE_GH_TOKEN
+# 编辑 .release, 填入 DOCKER_USERNAME / RELEASE_GH_TOKEN
 ```
 
 `.release` 已加入 `.gitignore`，**不会被提交**。脚本启动时会自动加载，shell 中同名环境变量优先级更高（用于 CI 注入）。
+
+##### GitHub Secrets（`build.yml` 需要）
+
+`build.yml` 的 Docker 登录步骤不再从 `gh workflow run -f` 传参，改为直接读取 GitHub Secrets。需要在仓库中配置：
+
+| Secret 名称 | 值 |
+|------------|-----|
+| `DOCKER_USERNAME` | Docker Hub 用户名 |
+| `DOCKER_PASSWORD` | Docker Hub 密码 / Access Token |
+
+配置路径：GitHub 仓库 → Settings → Secrets and variables → Actions → Repository secrets。
 
 #### 常用命令
 
@@ -285,7 +301,7 @@ Commits: 18 kept / 22 total  ·  Categories: 3
 5. 创建 `release: bump version to vX.Y.Z` commit，附带 5 条核心修改点
 6. 打 annotated tag，tag message 内嵌结构化变更摘要（标题区 + 类目分组 + emoji 图标，默认上限 12 条，可用 `--tag-limit=N` 调整）
 7. push master + tag 到远端
-8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub，Alpine + Debian）与 `build-package.yml`（二进制 + Release）
+8. 通过 `gh workflow run` 触发 `build.yml`（Docker Hub，Alpine + Debian，凭据由 GitHub Secrets 自动注入）与 `build-package.yml`（二进制 + Release）
 
 #### 幂等行为（可重入）
 

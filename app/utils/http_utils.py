@@ -1,6 +1,7 @@
 import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
+import log
 from config import Config
 
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -118,7 +119,8 @@ class RequestUtils:
                                     cookies=self._cookies,
                                     timeout=self._timeout,
                                     allow_redirects=allow_redirects)
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            log.debug(f"【RequestUtils】get_res 请求异常: {type(e).__name__}: {e}, url: {url[:120]}")
             if raise_exception:
                 raise requests.exceptions.RequestException
             return None

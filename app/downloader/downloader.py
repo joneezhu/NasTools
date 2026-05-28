@@ -544,6 +544,13 @@ class Downloader:
 
         # 拿不到 enclosure 时尝试 m-team 详情页
         url = media_info.enclosure
+        # 防御：上游若把 .torrent bytes 直接塞进 enclosure（历史 bug，参见 Torrent.format_enclosure 注释），
+        # 这里强制丢弃并走 __ensure_enclosure 兜底，避免后续 url.startswith 类型异常。
+        if isinstance(url, (bytes, bytearray)):
+            log.warn("【Downloader】enclosure 不是 URL 字符串而是 bytes，已丢弃由兜底逻辑重新解析；"
+                     "可能是上游 format_enclosure/类似入口塞错值")
+            media_info.enclosure = ""
+            url = ""
         if not url:
             self.__ensure_enclosure(media_info)
             url = media_info.enclosure

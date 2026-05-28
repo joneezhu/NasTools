@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import time
@@ -70,20 +71,39 @@ class Qbittorrent(_IDownloadClient):
         """
         连接qbittorrent
         :return: qbittorrent对象
+
+        说明：qbittorrent-api 在每次 API 调用时若收到 403 会自动 lazy 重新登录，
+        因此即使首次显式 auth_log_in 抛 LoginFailed，client 对象依然可用。
+        历史日志里 "qb 登录出错：" 冒号后空白就是 LoginFailed() 默认 message 为空所致，
+        实际上下载并未失败。这里做一次重试 + 降级为 warning，避免误导排障。
         """
         try:
-            # 登录
             qbt = qbittorrentapi.Client(host=self.host,
                                         port=self.port,
                                         username=self.username,
                                         password=self.password,
                                         VERIFY_WEBUI_CERTIFICATE=False,
                                         REQUESTS_ARGS={'timeout': (15, 60)})
-            try:
-                qbt.auth_log_in()
-                self.ver = qbt.app_version()
-            except qbittorrentapi.LoginFailed as e:
-                log.error(f"【{self.client_name}】{self.name} 登录出错：{str(e)}")
+            # 显式登录尝试：失败重试一次（多客户端竞争 / qb 刚启动 / session 瞬态）
+            login_err = None
+            for attempt in (1, 2):
+                try:
+                    qbt.auth_log_in()
+                    self.ver = qbt.app_version()
+                    login_err = None
+                    break
+                except qbittorrentapi.LoginFailed as e:
+                    login_err = e
+                    if attempt == 1:
+                        # 第一次失败先 sleep 一下再试
+                        time.sleep(1)
+                        continue
+            if login_err is not None:
+                msg = str(login_err) or login_err.__class__.__name__
+                log.warn(
+                    f"【{self.client_name}】{self.name} 显式登录失败：{msg}；"
+                    f"将依赖 API 调用时的自动重连，若后续操作仍失败请检查账号/IP是否被临时封禁"
+                )
             return qbt
         except Exception as err:
             log.error(f"【{self.client_name}】{self.name} 连接出错：{str(err)}")
@@ -498,9 +518,21 @@ class Qbittorrent(_IDownloadClient):
                                             seeding_time_limit=seeding_time_limit,
                                             use_auto_torrent_management=is_auto,
                                             cookie=cookie)
-            if qbc_ret and str(qbc_ret).find("Ok") != -1:
-                return True
-            # qb 返回非 Ok（含 "Fails."），说明被服务端拒绝；尝试事后比对，可能是种子已存在
+            if qbc_ret:
+                # 新版 qBittorrent 返回 JSON 字符串或 dict：{"added_torrent_ids":[...], "success_count":N, ...}
+                if isinstance(qbc_ret, str):
+                    try:
+                        qbc_ret = json.loads(qbc_ret)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if isinstance(qbc_ret, dict) and qbc_ret.get("success_count", 0) > 0:
+                    return True
+                # 旧版返回字符串格式 "Ok."
+                if str(qbc_ret).find("Ok") != -1:
+                    return True
+            # qb 返回失败（含 "Fails." / dict 且 success_count==0），说明被服务端拒绝；尝试事后比对，可能是种子已存在
+            log.warn(f"【{self.client_name}】{self.name} 添加种子失败：torrents_add 返回 {qbc_ret} | "
+                     f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}")
             if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):
                 log.warn(
                     f"【{self.client_name}】{self.name} 种子已存在于下载器中（torrents_add 返回 {qbc_ret}），"

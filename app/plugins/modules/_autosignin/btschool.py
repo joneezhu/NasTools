@@ -37,39 +37,39 @@ class BTSchool(_ISiteSigninHandler):
         ua = site_info.get("ua")
         proxy = Config().get_proxies() if site_info.get("proxy") else None
 
-        # 首页
-        chrome = ChromeHelper()
-        if site_info.get("chrome") and chrome.get_status():
-            self.info(f"{site} 开始仿真签到")
-            msg, html_text = self.__chrome_visit(chrome=chrome,
-                                                 url="https://pt.btschool.club/index.php",
-                                                 ua=ua,
-                                                 site_cookie=site_cookie,
-                                                 proxy=proxy,
-                                                 site=site)
-            # 仿真访问失败
-            if msg:
-                return False, msg
+        if site_info.get("chrome"):
+            with ChromeHelper() as chrome:
+                if chrome.get_status():
+                    self.info(f"{site} 开始仿真签到")
+                    msg, html_text = self.__chrome_visit(chrome=chrome,
+                                                         url="https://pt.btschool.club/index.php",
+                                                         ua=ua,
+                                                         site_cookie=site_cookie,
+                                                         proxy=proxy,
+                                                         site=site)
+                    # 仿真访问失败
+                    if msg:
+                        return False, msg
 
-            # 已签到
-            if self._sign_text not in html_text:
-                self.info(f"今日已签到")
-                return True, f'【{site}】今日已签到'
+                    # 已签到
+                    if self._sign_text not in html_text:
+                        self.info(f"今日已签到")
+                        return True, f'【{site}】今日已签到'
 
-            # 仿真签到
-            msg, html_text = self.__chrome_visit(chrome=chrome,
-                                                 url="https://pt.btschool.club/index.php?action=addbonus",
-                                                 ua=ua,
-                                                 site_cookie=site_cookie,
-                                                 proxy=proxy,
-                                                 site=site)
-            if msg:
-                return False, msg
+                    # 仿真签到
+                    msg, html_text = self.__chrome_visit(chrome=chrome,
+                                                         url="https://pt.btschool.club/index.php?action=addbonus",
+                                                         ua=ua,
+                                                         site_cookie=site_cookie,
+                                                         proxy=proxy,
+                                                         site=site)
+                    if msg:
+                        return False, msg
 
-            # 签到成功
-            if self._sign_text not in html_text:
-                self.info(f"签到成功")
-                return True, f'【{site}】签到成功'
+                    # 签到成功
+                    if self._sign_text not in html_text:
+                        self.info(f"签到成功")
+                        return True, f'【{site}】签到成功'
         else:
             self.info(f"{site} 开始签到")
             html_res = RequestUtils(cookies=site_cookie,

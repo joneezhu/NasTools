@@ -316,42 +316,43 @@ class Sites:
             site_url = site_url + '/index.php'
         elif 'm-team' in site_url:
             return MTeamApi.test_mt_connection(site_info);
-        chrome = ChromeHelper()
-        if site_info.get("chrome") and chrome.get_status():
-            # 计时
-            start_time = datetime.now()
-            if not chrome.visit(url=site_url, ua=ua, apikey=site_apikey, cookie=site_cookie, proxy=site_info.get("proxy")):
-                return False, "Chrome模拟访问失败", 0
-            # 循环检测是否过cf
-            cloudflare = chrome.pass_cloudflare()
-            seconds = int((datetime.now() - start_time).microseconds / 1000)
-            if not cloudflare:
-                return False, "跳转站点失败", seconds
-            # 判断是否已签到
-            html_text = chrome.get_html()
-            if not html_text:
-                return False, "获取站点源码失败", 0
-            if SiteHelper.is_logged_in(html_text):
-                return True, "连接成功", seconds
-            else:
+        if site_info.get("chrome"):
+            with ChromeHelper() as chrome:
+                if chrome.get_status():
+                    # 计时
+                    start_time = datetime.now()
+                    if not chrome.visit(url=site_url, ua=ua, apikey=site_apikey, cookie=site_cookie, proxy=site_info.get("proxy")):
+                        return False, "Chrome模拟访问失败", 0
+                    # 循环检测是否过cf
+                    cloudflare = chrome.pass_cloudflare()
+                    seconds = int((datetime.now() - start_time).microseconds / 1000)
+                    if not cloudflare:
+                        return False, "跳转站点失败", seconds
+                    # 判断是否已签到
+                    html_text = chrome.get_html()
+                    if not html_text:
+                        return False, "获取站点源码失败", 0
+                    if SiteHelper.is_logged_in(html_text):
+                        return True, "连接成功", seconds
+                    else:
+                        return False, "Cookie失效", seconds
+        # Chrome 不可用或未开启时走 Requests 兜底
+        # 计时
+        start_time = datetime.now()
+        res = RequestUtils(cookies=site_cookie,
+                           headers=ua,
+                           proxies=Config().get_proxies() if site_info.get("proxy") else None
+                           ).get_res(url=site_url)
+        seconds = int((datetime.now() - start_time).microseconds / 1000)
+        if res and res.status_code == 200:
+            if not SiteHelper.is_logged_in(res.text):
                 return False, "Cookie失效", seconds
-        else:
-            # 计时
-            start_time = datetime.now()
-            res = RequestUtils(cookies=site_cookie,
-                               headers=ua,
-                               proxies=Config().get_proxies() if site_info.get("proxy") else None
-                               ).get_res(url=site_url)
-            seconds = int((datetime.now() - start_time).microseconds / 1000)
-            if res and res.status_code == 200:
-                if not SiteHelper.is_logged_in(res.text):
-                    return False, "Cookie失效", seconds
-                else:
-                    return True, "连接成功", seconds
-            elif res is not None:
-                return False, f"连接失败，状态码：{res.status_code}", seconds
             else:
-                return False, "无法打开网站", seconds
+                return True, "连接成功", seconds
+        elif res is not None:
+            return False, f"连接失败，状态码：{res.status_code}", seconds
+        else:
+            return False, "无法打开网站", seconds
 
     @staticmethod
     def __get_site_note_items(note):

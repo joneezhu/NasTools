@@ -4,12 +4,19 @@
 #   2. 填入下面的真实值
 #   3. .release 已加入 .gitignore, 不会被提交
 #
-# 这些值仅给 scripts/release.sh 在触发 GitHub Actions workflow_dispatch 时使用。
+# ── 本地用途 (release.sh 读取) ──
+# DOCKER_USERNAME: 用于 release.sh 检查 Docker Hub 镜像状态
+# RELEASE_GH_TOKEN: 用于 gh CLI 鉴权 (gh auth token)
 
-# Docker Hub 凭据 (build.yml / build-beta.yml 入参)
+# Docker Hub 用户名 (release.sh 检查镜像状态用)
 DOCKER_USERNAME=
-DOCKER_PASSWORD=
 
-# Release 用 GitHub Personal Access Token (build-package.yml 入参)
+# Release 用 GitHub Personal Access Token (release.sh 本地使用)
 # 权限要求: repo (创建 release + 上传 assets)
 RELEASE_GH_TOKEN=
+
+# ── GitHub Secrets (build.yml 读取, 需在仓库 Settings 中配置) ──
+# DOCKER_USERNAME  — Docker Hub 用户名
+# DOCKER_PASSWORD  — Docker Hub 密码 / Access Token
+# 配置路径: GitHub 仓库 → Settings → Secrets and variables → Actions
+# 这些值不再放在 .release 中, build.yml 直接从 GitHub Secrets 读取

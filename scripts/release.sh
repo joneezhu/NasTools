@@ -23,9 +23,9 @@
 #
 # 凭据来源 (触发构建时需要):
 #   项目根目录 .release 文件 (KEY=VALUE 格式, 已 gitignore), 至少包含:
-#     DOCKER_USERNAME=...
-#     DOCKER_PASSWORD=...
-#     RELEASE_GH_TOKEN=...
+#     DOCKER_USERNAME=...    (release.sh 检查 Docker Hub 状态用)
+#     RELEASE_GH_TOKEN=...   (gh CLI 鉴权用)
+#   DOCKER_PASSWORD 不再由 release.sh 使用, 改为在 GitHub Secrets 中配置 (build.yml 读取)。
 #   shell 中已设置的同名环境变量优先级更高, 会覆盖 .release 中的值。
 #
 # 依赖: git, gh (GitHub CLI), python3
@@ -77,7 +77,8 @@ mkdir -p "$CHANGELOG_DIR"
 
 # ---------- 加载 .release 凭据 ----------
 # .release 是 KEY=VALUE 形式的环境文件 (已加入 .gitignore, 不会上传)
-# 至少需要: DOCKER_USERNAME / DOCKER_PASSWORD / RELEASE_GH_TOKEN
+# 至少需要: DOCKER_USERNAME (检查 Docker Hub 状态) / RELEASE_GH_TOKEN (gh CLI 鉴权)
+# DOCKER_PASSWORD 不再由此脚本使用, 而是配置在 GitHub Secrets 中供 build.yml 读取
 if [[ -f "$RELEASE_ENV_FILE" ]]; then
   log "加载 $RELEASE_ENV_FILE"
   # 安全读取: 只允许 KEY=VALUE 形式的纯赋值, 自动过滤注释和空行
@@ -124,7 +125,18 @@ CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 $DRY_RUN || { log "git fetch --tags"; git fetch --tags --quiet; }
 
 # 取上一个 tag
-LAST_TAG="$(git tag --sort=-creatordate | head -n1 || true)"
+# 当目标是正式版 (无 -beta/-rc/-alpha 等后缀) 时, 起点 tag 严格只看正式版,
+# 找不到则按 "首次发布" 处理 (从首个 commit 聚合), 绝不回落到 prerelease.
+# 这样 v3.4.2 正式版的 changelog 会从上一个正式版 (例如 v3.4.1) 算起,
+# 而不是 v3.4.2-beta.7 -> v3.4.2 这一小段.
+# 当目标本身是 prerelease (例如 v3.4.2-beta.8) 时, 仍取最近的任意 tag (含 prerelease) 作为起点.
+if [[ "$NEW_VERSION" == *-* ]]; then
+  # prerelease: 起点取最近一个 tag (任意类型)
+  LAST_TAG="$(git tag --sort=-creatordate | head -n1 || true)"
+else
+  # 正式版: 起点取最近一个 "正式版" tag, 严格跳过所有 prerelease, 不做 fallback.
+  LAST_TAG="$(git tag --sort=-creatordate | grep -Ev -- '-' | head -n1 || true)"
+fi
 if [[ -z "$LAST_TAG" ]]; then
   warn "未找到任何已有 tag, 将从首个 commit 起算"
   RANGE_FROM="$(git rev-list --max-parents=0 HEAD | head -n1)"
@@ -263,12 +275,9 @@ if $SKIP_COMMIT_TAG; then
   REPO_PATH="$(git config --get remote.origin.url | sed -E 's#.*github.com[:/](.*)\.git#\1#')"
 
   if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
-    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
-    : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
+    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (检查 Docker Hub 镜像状态必备)}"
     log "通过 gh 触发 build.yml (Docker Alpine + Debian, ref=$NEW_VERSION)..."
-    gh workflow run build.yml --ref "$NEW_VERSION" \
-      -f docker_username="$DOCKER_USERNAME" \
-      -f docker_password="$DOCKER_PASSWORD"
+    gh workflow run build.yml --ref "$NEW_VERSION"
     ok "build.yml 已派发 (ref=$NEW_VERSION)"
   fi
 
@@ -387,7 +396,7 @@ if ! $RUN_BUILD; then
   echo "    需要触发构建请运行 (会基于 tag $NEW_VERSION 派发 workflow):"
   echo "      scripts/release.sh $NEW_VERSION --build"
   echo "    或者直接手动:"
-  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=..."
+  echo "      gh workflow run build.yml         --ref $NEW_VERSION"
   echo "      gh workflow run build-package.yml --ref $NEW_VERSION"
   echo
   ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
@@ -406,16 +415,15 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (或去掉 --build)}"
-: "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (或去掉 --build)}"
 : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN (或去掉 --build)}"
+# DOCKER_PASSWORD 不再由 release.sh 使用，
+# 已在 build.yml 中改为读取 GitHub Secrets: DOCKER_PASSWORD
 
 # ref 一律用新 tag, 而非 master 分支:
 # 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
 # 2) 用分支名时, 如果之后该分支又有新 commit, ref 会漂移; 用 tag 永远精确指向本次发布
 log "通过 gh 触发 build.yml (Docker Hub Alpine + Debian, ref=$NEW_VERSION)..."
-gh workflow run build.yml --ref "$NEW_VERSION" \
-  -f docker_username="$DOCKER_USERNAME" \
-  -f docker_password="$DOCKER_PASSWORD"
+gh workflow run build.yml --ref "$NEW_VERSION"
 
 log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
 # build-package.yml 不再声明任何 inputs (改用 secrets.GITHUB_TOKEN), 不要传 -f github_token=...
