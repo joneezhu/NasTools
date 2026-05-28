@@ -277,9 +277,7 @@ if $SKIP_COMMIT_TAG; then
     : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
     : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
     log "通过 gh 触发 build.yml (Docker Alpine + Debian, ref=$NEW_VERSION)..."
-    gh workflow run build.yml --ref "$NEW_VERSION" \
-      -f docker_username="$DOCKER_USERNAME" \
-      -f docker_password="$DOCKER_PASSWORD"
+    gh workflow run build.yml --ref "$NEW_VERSION"
     ok "build.yml 已派发 (ref=$NEW_VERSION)"
   fi
 
@@ -398,7 +396,7 @@ if ! $RUN_BUILD; then
   echo "    需要触发构建请运行 (会基于 tag $NEW_VERSION 派发 workflow):"
   echo "      scripts/release.sh $NEW_VERSION --build"
   echo "    或者直接手动:"
-  echo "      gh workflow run build.yml         --ref $NEW_VERSION -f docker_username=... -f docker_password=..."
+  echo "      gh workflow run build.yml         --ref $NEW_VERSION"
   echo "      gh workflow run build-package.yml --ref $NEW_VERSION"
   echo
   ok "Release $NEW_VERSION 本地动作完成 ✅ (CI 未触发)"
@@ -424,9 +422,7 @@ fi
 # 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
 # 2) 用分支名时, 如果之后该分支又有新 commit, ref 会漂移; 用 tag 永远精确指向本次发布
 log "通过 gh 触发 build.yml (Docker Hub Alpine + Debian, ref=$NEW_VERSION)..."
-gh workflow run build.yml --ref "$NEW_VERSION" \
-  -f docker_username="$DOCKER_USERNAME" \
-  -f docker_password="$DOCKER_PASSWORD"
+gh workflow run build.yml --ref "$NEW_VERSION"
 
 log "通过 gh 触发 build-package.yml (二进制 + Release, ref=$NEW_VERSION)..."
 # build-package.yml 不再声明任何 inputs (改用 secrets.GITHUB_TOKEN), 不要传 -f github_token=...
