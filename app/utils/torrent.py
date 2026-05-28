@@ -145,7 +145,7 @@ class Torrent:
         elif req.status_code == 429:
             return None, None, "触发站点流控，请稍后重试"
         else:
-            return None, None, "下载种子出错，状态码：%s" % req.status_code
+            return None, None, "下载种子失败，状态码：%s" % req.status_code
 
         return file_path, file_content, ""
 

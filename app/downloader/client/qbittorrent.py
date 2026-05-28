@@ -520,6 +520,8 @@ class Qbittorrent(_IDownloadClient):
             if qbc_ret and str(qbc_ret).find("Ok") != -1:
                 return True
             # qb 返回非 Ok（含 "Fails."），说明被服务端拒绝；尝试事后比对，可能是种子已存在
+            log.warn(f"【{self.client_name}】{self.name} 添加种子失败：torrents_add 返回 {qbc_ret} | "
+                     f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}")
             if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):
                 log.warn(
                     f"【{self.client_name}】{self.name} 种子已存在于下载器中（torrents_add 返回 {qbc_ret}），"
