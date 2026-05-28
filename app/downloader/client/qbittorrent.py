@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import time
@@ -518,7 +519,12 @@ class Qbittorrent(_IDownloadClient):
                                             use_auto_torrent_management=is_auto,
                                             cookie=cookie)
             if qbc_ret:
-                # 新版 qBittorrent 返回 dict 格式：{"added_torrent_ids":[...], "success_count":N, ...}
+                # 新版 qBittorrent 返回 JSON 字符串或 dict：{"added_torrent_ids":[...], "success_count":N, ...}
+                if isinstance(qbc_ret, str):
+                    try:
+                        qbc_ret = json.loads(qbc_ret)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 if isinstance(qbc_ret, dict) and qbc_ret.get("success_count", 0) > 0:
                     return True
                 # 旧版返回字符串格式 "Ok."
