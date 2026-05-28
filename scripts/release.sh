@@ -23,9 +23,9 @@
 #
 # 凭据来源 (触发构建时需要):
 #   项目根目录 .release 文件 (KEY=VALUE 格式, 已 gitignore), 至少包含:
-#     DOCKER_USERNAME=...
-#     DOCKER_PASSWORD=...
-#     RELEASE_GH_TOKEN=...
+#     DOCKER_USERNAME=...    (release.sh 检查 Docker Hub 状态用)
+#     RELEASE_GH_TOKEN=...   (gh CLI 鉴权用)
+#   DOCKER_PASSWORD 不再由 release.sh 使用, 改为在 GitHub Secrets 中配置 (build.yml 读取)。
 #   shell 中已设置的同名环境变量优先级更高, 会覆盖 .release 中的值。
 #
 # 依赖: git, gh (GitHub CLI), python3
@@ -77,7 +77,8 @@ mkdir -p "$CHANGELOG_DIR"
 
 # ---------- 加载 .release 凭据 ----------
 # .release 是 KEY=VALUE 形式的环境文件 (已加入 .gitignore, 不会上传)
-# 至少需要: DOCKER_USERNAME / DOCKER_PASSWORD / RELEASE_GH_TOKEN
+# 至少需要: DOCKER_USERNAME (检查 Docker Hub 状态) / RELEASE_GH_TOKEN (gh CLI 鉴权)
+# DOCKER_PASSWORD 不再由此脚本使用, 而是配置在 GitHub Secrets 中供 build.yml 读取
 if [[ -f "$RELEASE_ENV_FILE" ]]; then
   log "加载 $RELEASE_ENV_FILE"
   # 安全读取: 只允许 KEY=VALUE 形式的纯赋值, 自动过滤注释和空行
@@ -274,8 +275,7 @@ if $SKIP_COMMIT_TAG; then
   REPO_PATH="$(git config --get remote.origin.url | sed -E 's#.*github.com[:/](.*)\.git#\1#')"
 
   if $REBUILD_BOTH || $ONLY_REBUILD_DOCKER; then
-    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (重跑 build.yml 必备)}"
-    : "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (重跑 build.yml 必备)}"
+    : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (检查 Docker Hub 镜像状态必备)}"
     log "通过 gh 触发 build.yml (Docker Alpine + Debian, ref=$NEW_VERSION)..."
     gh workflow run build.yml --ref "$NEW_VERSION"
     ok "build.yml 已派发 (ref=$NEW_VERSION)"
@@ -415,8 +415,9 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 : "${DOCKER_USERNAME:?需要在 .release 文件中配置 DOCKER_USERNAME (或去掉 --build)}"
-: "${DOCKER_PASSWORD:?需要在 .release 文件中配置 DOCKER_PASSWORD (或去掉 --build)}"
 : "${RELEASE_GH_TOKEN:?需要在 .release 文件中配置 RELEASE_GH_TOKEN (或去掉 --build)}"
+# DOCKER_PASSWORD 不再由 release.sh 使用，
+# 已在 build.yml 中改为读取 GitHub Secrets: DOCKER_PASSWORD
 
 # ref 一律用新 tag, 而非 master 分支:
 # 1) build-package.yml 的 softprops/action-gh-release 默认会把 Release 绑到 ref 对应的 tag
