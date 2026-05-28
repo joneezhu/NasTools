@@ -113,6 +113,22 @@ def linkify_issues(text):
     return re.sub(r"(?:(?<=^)|(?<=[\s(\[,;:]))(?:#|GH-)(\d+)\b", repl, text)
 
 
+# 转义 @-mention: GitHub Release 页面会扫描 body 中的 @xxx 形式 mention,
+# 自动把对应 GitHub 用户/组织提取到顶部的 Contributors 区域。
+# commit message 里出现的 Python 装饰器 (@classmethod / @staticmethod /
+# @property / @dataclass / @DbPersist 等) 或 npm scope (@vue/cli) 等也会
+# 被误识别, 导致 Release 显示并不相关的 "Contributors"。
+# 修复: 在 @ 与后续标识符之间插入零宽 <wbr> 标签 -- HTML 渲染时视觉无差异,
+# 但 GitHub 的 mention 解析器不再识别。仅对最终进 Release body 的
+# MARK_CHANGELOG_FILE 段生效, 纯文本 tag message 不处理。
+_MENTION_SAFE = {"@", "@@"}  # 保留 markdown 转义 "\\@" 等场景
+
+
+def escape_mentions(text):
+    # 不动反引号内代码 (反引号内 GitHub 仍可能解析 @, 但保守起见统一处理)
+    return re.sub(r"@(?=[A-Za-z0-9])", "@<wbr>", text)
+
+
 buckets = collections.OrderedDict(
     (k, []) for k in ["Breaking", "Added", "Changed", "Fixed", "Removed", "Deprecated", "Security"]
 )
@@ -164,7 +180,7 @@ for cat, items in buckets.items():
     file_lines.append(f"## {cat}")
     file_lines.append("")
     for norm, short, full in items:
-        file_lines.append(f"- {linkify_issues(norm)} ({commit_link(short, full)})")
+        file_lines.append(f"- {escape_mentions(linkify_issues(norm))} ({commit_link(short, full)})")
     file_lines.append("")
 if not any_in_file:
     file_lines.append("## Changed")
