@@ -517,9 +517,14 @@ class Qbittorrent(_IDownloadClient):
                                             seeding_time_limit=seeding_time_limit,
                                             use_auto_torrent_management=is_auto,
                                             cookie=cookie)
-            if qbc_ret and str(qbc_ret).find("Ok") != -1:
-                return True
-            # qb 返回非 Ok（含 "Fails."），说明被服务端拒绝；尝试事后比对，可能是种子已存在
+            if qbc_ret:
+                # 新版 qBittorrent 返回 dict 格式：{"added_torrent_ids":[...], "success_count":N, ...}
+                if isinstance(qbc_ret, dict) and qbc_ret.get("success_count", 0) > 0:
+                    return True
+                # 旧版返回字符串格式 "Ok."
+                if str(qbc_ret).find("Ok") != -1:
+                    return True
+            # qb 返回失败（含 "Fails." / dict 且 success_count==0），说明被服务端拒绝；尝试事后比对，可能是种子已存在
             log.warn(f"【{self.client_name}】{self.name} 添加种子失败：torrents_add 返回 {qbc_ret} | "
                      f"save_path={save_path}, category={category}, is_auto={is_auto}, tags={tags}")
             if self.__exists_in_qb(urls=urls, tag=tags, info_hash=info_hash):

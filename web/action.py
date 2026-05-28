@@ -2592,8 +2592,20 @@ class WebAction:
         """
         # 输入值
         brushtask_id = data.get("brushtask_id")
-        log.info(f"【BrushTask】save brushtask, id={brushtask_id!r}, name={data.get('brushtask_name', '')!r}")
         brushtask_name = data.get("brushtask_name")
+        log.info(f"【BrushTask】save brushtask, id={brushtask_id!r}, name={brushtask_name!r}")
+        # 防御：如果 brushtask_id 为空但存在同名任务，打 warning 帮助排查重复任务问题
+        if not brushtask_id:
+            existing = BrushTask().get_brushtask_info()
+            same_name_tasks = [
+                tid for tid, t in existing.items()
+                if t.get("name") == brushtask_name
+            ]
+            if same_name_tasks:
+                log.warn(
+                    f"【BrushTask】新建任务名称 '{brushtask_name}' 已存在（id={same_name_tasks}），"
+                    f"疑似编辑操作丢失 brushtask_id，将创建重复任务！"
+                )
         brushtask_site = data.get("brushtask_site")
         brushtask_interval = data.get("brushtask_interval")
         brushtask_downloader = data.get("brushtask_downloader")

@@ -812,6 +812,9 @@
   // 显示编辑刷流任务
   function edit_brushtask_modal(brushid) {
     $("#brushtask_id").val(brushid);
+    // 立即显示弹窗（带 loading 态），避免和"新建任务"产生时序竞争导致 brushtask_id 被覆盖
+    $("#brushtask_modal_title").text("正在加载...");
+    $("#modal-brushtask").modal('show');
     ajax_post("brushtask_detail", {"id": brushid}, function (ret) {
       if (ret.code == 0) {
         //赋值
