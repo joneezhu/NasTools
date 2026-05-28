@@ -75,6 +75,7 @@ class _WebSocketErrorMiddleware:
             return self.app(environ, start_response)
         except WsConnectionError:
             # WebSocket 客户端断连（关标签页等），正常现象，静默处理
+            start_response('200 OK', [])
             return [b'']
 
 

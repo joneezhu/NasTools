@@ -200,13 +200,11 @@ class SiteConf:
                     del SiteConf._page_cache[cache_key]
         # 抓取页面
         html_text = None
-        chrome = ChromeHelper(headless=True)
-        if render and chrome.get_status():
-            # 开渲染
-            if chrome.visit(url=url, cookie=cookie, ua=ua, proxy=proxy):
-                # 等待页面加载完成
-                time.sleep(10)
-                html_text = chrome.get_html()
+        if render:
+            with ChromeHelper(headless=True) as chrome:
+                if chrome.get_status() and chrome.visit(url=url, cookie=cookie, ua=ua, proxy=proxy):
+                    time.sleep(10)
+                    html_text = chrome.get_html()
         else:
             res = RequestUtils(
                 cookies=cookie,

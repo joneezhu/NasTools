@@ -75,19 +75,22 @@ class SiteUserInfo(object):
             return MTeamTorrentUserInfo(site_name, site_domain_url, site_cookie, "", session=session, ua=ua, apikey=apikey, emulate=emulate, proxy=proxy)
 
         # 检测环境，有浏览器内核的优先使用仿真签到
-        chrome = ChromeHelper()
-        if emulate and chrome.get_status():
-            if not chrome.visit(url=url, ua=ua, apikey=apikey, cookie=site_cookie, proxy=proxy):
-                log.error("【Sites】%s 无法打开网站" % site_name)
-                return None
-            # 循环检测是否过cf
-            cloudflare = chrome.pass_cloudflare()
-            if not cloudflare:
-                log.error("【Sites】%s 跳转站点失败" % site_name)
-                return None
-            # 判断是否已签到
-            html_text = chrome.get_html()
-        else:
+        html_text = None
+        if emulate:
+            with ChromeHelper() as chrome:
+                if chrome.get_status():
+                    if not chrome.visit(url=url, ua=ua, apikey=apikey, cookie=site_cookie, proxy=proxy):
+                        log.error("【Sites】%s 无法打开网站" % site_name)
+                        return None
+                    # 循环检测是否过cf
+                    cloudflare = chrome.pass_cloudflare()
+                    if not cloudflare:
+                        log.error("【Sites】%s 跳转站点失败" % site_name)
+                        return None
+                    # 判断是否已签到
+                    html_text = chrome.get_html()
+        # Chrome 不可用时走 Requests 兜底
+        if not html_text:
             proxies = Config().get_proxies() if proxy else None
             res = RequestUtils(cookies=site_cookie,
                                session=session,

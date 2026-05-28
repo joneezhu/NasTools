@@ -37,6 +37,13 @@ class ChromeHelper(object):
         else:
             self._headless = headless
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.quit()
+        return False
+
     def init_driver(self):
         if self._executable_path:
             return
