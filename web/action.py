@@ -1344,14 +1344,19 @@ class WebAction:
                 return {"code": 1, "msg": f"GitHub /tags 拉取失败 (status={code})"}
             raw_tags = tags_res.json() or []
 
-            # 2) releases（可选，用于校正 prerelease 标识 + 拿 published_at）
+            # 2) releases（用于校正 prerelease 标识 + 拿 published_at + releases_only 过滤）
+            #    注意: releases_only 模式下, release_tag_set 是否为空决定了过滤是否生效,
+            #    因此这里 release 拉取失败必须报错, 否则会退化为"全量 tag 都通过"的行为,
+            #    导致用户开了"仅检查 Release 更新"还能看到所有 git tag。
             prerelease_set = set()
             published_map = {}
+            rel_fetched = False
             try:
                 rel_res = req.get_res(
                     "https://api.github.com/repos/joneezhu/NasTools/releases?per_page=30"
                 )
                 if rel_res and rel_res.status_code == 200:
+                    rel_fetched = True
                     for r in (rel_res.json() or []):
                         tn = r.get("tag_name")
                         if not tn:
@@ -1361,7 +1366,7 @@ class WebAction:
                         if r.get("published_at"):
                             published_map[tn] = r.get("published_at")
             except Exception:
-                pass  # release 拉不到只是没有 changelog/标识，不致命
+                pass  # release 拉不到的容错见下方 releases_only 分支
 
             # 3) 当前 commit/tag（尽量给前端高亮当前版本）
             current_ref = ""
@@ -1392,13 +1397,22 @@ class WebAction:
             releases_only = bool(app_cfg.get("releases_update_only"))
             release_tag_set = set(published_map.keys())  # /releases 里的 tag 集合
 
+            # releases_only=True 但 release 接口拉取失败时, 直接报错而不是退化为全量,
+            # 否则用户会看到"开了开关却照样拉到所有 tag"的诡异现象。
+            if releases_only and not rel_fetched:
+                return {
+                    "code": 1,
+                    "msg": "已开启「仅检查 Release 更新」，但 GitHub /releases 接口拉取失败，请检查网络/代理后重试",
+                }
+
             tags = []
             for t in raw_tags:
                 name = t.get("name") or ""
                 if not name:
                     continue
-                # releases_only 模式下，过滤掉非 Release 标签（仅是 git tag、未发 GitHub Release 的不算）
-                if releases_only and release_tag_set and name not in release_tag_set:
+                # releases_only 模式: 严格按 release_tag_set 过滤,
+                # 即使集合为空(没有任何 Release)也要保持空列表, 不再退化放行。
+                if releases_only and name not in release_tag_set:
                     continue
                 tags.append({
                     "name": name,
