@@ -35,6 +35,7 @@ ENV S6_SERVICES_GRACETIME=30000 \
     PATH=${PATH}:/usr/lib/chromium \
     LANG="C.UTF-8" \
     TZ="Asia/Shanghai" \
+    PYTHONUNBUFFERED=1 \
     NASTOOL_CONFIG="/config/config.yaml" \
     NASTOOL_AUTO_UPDATE=false \
     NASTOOL_CN_UPDATE=true \
