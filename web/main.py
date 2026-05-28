@@ -23,7 +23,7 @@ from flask_compress import Compress
 from flask_login import LoginManager, login_user, login_required, current_user
 from flask_sock import Sock
 from icalendar import Calendar, Event, Alarm
-from simple_websocket import ConnectionClosed
+from simple_websocket import ConnectionClosed, ConnectionError as WsConnectionError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import log
@@ -64,9 +64,23 @@ else:
 # 配置文件锁
 ConfigLock = Lock()
 
+# WebSocket 断连静默中间件
+class _WebSocketErrorMiddleware:
+    """拦截 flask_sock 断连时的 ConnectionError，避免产生噪音堆栈日志"""
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        try:
+            return self.app(environ, start_response)
+        except WsConnectionError:
+            # WebSocket 客户端断连（关标签页等），正常现象，静默处理
+            return [b'']
+
+
 # Flask App
 App = Flask(__name__)
-App.wsgi_app = ProxyFix(App.wsgi_app)
+App.wsgi_app = ProxyFix(_WebSocketErrorMiddleware(App.wsgi_app))
 App.config['JSON_AS_ASCII'] = False
 App.config['JSON_SORT_KEYS'] = False
 App.config['SOCK_SERVER_OPTIONS'] = {'ping_interval': 25}
