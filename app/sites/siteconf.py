@@ -185,19 +185,19 @@ class SiteConf:
         time.sleep(round(random.uniform(1, 5), 1))
         return ret_attr
 
-    @staticmethod
-    def __get_site_page_html(url, cookie, ua, render=False, proxy=False):
+    @classmethod
+    def __get_site_page_html(cls, url, cookie, ua, render=False, proxy=False):
         cache_key = (url, cookie, ua, render, proxy)
         current_time = time.time()
         # 检查缓存（带TTL过期）
-        with SiteConf._page_cache_lock:
-            cached = SiteConf._page_cache.get(cache_key)
+        with cls._page_cache_lock:
+            cached = cls._page_cache.get(cache_key)
             if cached:
                 cached_time, cached_html = cached
-                if current_time - cached_time < SiteConf._PAGE_CACHE_TTL:
+                if current_time - cached_time < cls._PAGE_CACHE_TTL:
                     return cached_html
                 else:
-                    del SiteConf._page_cache[cache_key]
+                    del cls._page_cache[cache_key]
         # 抓取页面
         html_text = None
         if render:
@@ -216,12 +216,12 @@ class SiteConf:
                 html_text = res.text
         # 写入缓存并清理过期条目
         if html_text:
-            with SiteConf._page_cache_lock:
-                SiteConf._page_cache[cache_key] = (current_time, html_text)
+            with cls._page_cache_lock:
+                cls._page_cache[cache_key] = (current_time, html_text)
                 # 缓存超过200条时清理过期条目
-                if len(SiteConf._page_cache) > 200:
-                    expired_keys = [k for k, v in SiteConf._page_cache.items()
-                                    if current_time - v[0] > SiteConf._PAGE_CACHE_TTL]
+                if len(cls._page_cache) > 200:
+                    expired_keys = [k for k, v in cls._page_cache.items()
+                                    if current_time - v[0] > cls._PAGE_CACHE_TTL]
                     for k in expired_keys:
-                        del SiteConf._page_cache[k]
+                        del cls._page_cache[k]
         return html_text
