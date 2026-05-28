@@ -11,6 +11,7 @@ fuse3
 git
 inotify-tools
 locales
+musl-dev
 netcat
 procps
 redis
