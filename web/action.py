@@ -2592,6 +2592,7 @@ class WebAction:
         """
         # 输入值
         brushtask_id = data.get("brushtask_id")
+        log.info(f"【BrushTask】save brushtask, id={brushtask_id!r}, name={data.get('brushtask_name', '')!r}")
         brushtask_name = data.get("brushtask_name")
         brushtask_site = data.get("brushtask_site")
         brushtask_interval = data.get("brushtask_interval")
