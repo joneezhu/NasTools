@@ -766,6 +766,7 @@ class BrushTask(object):
         try:
             if rss_rule.get("size"):
                 rule_sizes = rss_rule.get("size").split("#")
+                log.debug("【Brush】%s 规则大小：%s" % (title, rule_sizes))
                 if rule_sizes[0]:
                     if len(rule_sizes) > 1 and rule_sizes[1]:
                         min_max_size = rule_sizes[1].split(',')
@@ -784,11 +785,13 @@ class BrushTask(object):
 
             # 检查包含规则
             if rss_rule.get("include"):
+                log.debug("【Brush】%s 规则包含：%s" % (title, rss_rule.get("include")))
                 if not re.search(r"%s" % rss_rule.get("include"), title):
                     return False
 
             # 检查排除规则
             if rss_rule.get("exclude"):
+                log.debug("【Brush】%s 规则排除：%s" % (title, rss_rule.get("exclude")))
                 if re.search(r"%s" % rss_rule.get("exclude"), title):
                     return False
 
@@ -854,6 +857,7 @@ class BrushTask(object):
             # 检查发布时间
             if rss_rule.get("pubdate") and pubdate:
                 rule_pubdates = rss_rule.get("pubdate").split("#")
+                log.debug("【Brush】%s 规则发布时间：%s" % (title, rule_pubdates))
                 if len(rule_pubdates) >= 2 and rule_pubdates[1]:
                     min_max_pubdates = rule_pubdates[1].split(',')
                     min_pubdate = min_max_pubdates[0]
@@ -882,6 +886,7 @@ class BrushTask(object):
         except Exception as err:
             log.error("【Brush】%s 规则检查异常: %s" % (title, str(err)))
             ExceptionUtils.exception_traceback(err)
+            return False
         log.info("【Brush】%s 通过所有规则检查" % title)
         return True
 
